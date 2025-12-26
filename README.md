@@ -114,6 +114,7 @@ Per-symbol overrides live in `configs/pairs/<SYMBOL>.yaml`.
   Output includes precision/recall, missing/extra signals, and the first mismatch timestamp.
 - Exporting TV alerts: use your TradingView alert log export (CSV) with columns `symbol,side,confirm_time_ms` (millisecond close timestamp). For bars, use your own OHLCV export; the bot assumes close-time ordering and bar-close semantics only.
 - Known limits: CVD parity is best-effort (depends on aggTrade availability); if REST backfill fails, the engine will pause alerts for that symbol until healed.
+- In parity mode, cooldown is forced to 0 to avoid dropping valid TV-equivalent alerts.
 
 ## Corporate Telegram alerts
 - Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.

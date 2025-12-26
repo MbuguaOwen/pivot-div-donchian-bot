@@ -36,8 +36,8 @@ strategy:
   fire_on_close_only: true
 
 parity:
-  mode: false
-  ema_seed_mode: "first"   # "first" (default) | "sma" (Pine-style seed)
+  mode: true
+  ema_seed_mode: "sma"   # "first" (default) | "sma" (Pine-style seed)
   pivot_tie_break: "tv_like" # tie-break when equal highs/lows inside window
   warmup_bars: 0
   gap_heal: true

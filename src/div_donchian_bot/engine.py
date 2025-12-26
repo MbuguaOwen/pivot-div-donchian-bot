@@ -122,10 +122,8 @@ class BotEngine:
         limits = self.cfg.get("limits", {}) or {}
         self.max_positions_total = int(limits.get("max_positions_total", 20))
         default_cooldown = int(limits.get("cooldown_minutes_per_symbol", 30))
-        if self.parity_cfg.mode:
-            self.cooldown_minutes = int(limits.get("cooldown_minutes_per_symbol", 0))
-        else:
-            self.cooldown_minutes = default_cooldown
+        # Parity mode must not suppress alerts via cooldown
+        self.cooldown_minutes = 0 if self.parity_cfg.mode else default_cooldown
 
         self.orders_cfg = self.cfg.get("orders", {}) or {}
         self.position_cfg = self.cfg.get("position", {}) or {}
