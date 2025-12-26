@@ -152,7 +152,9 @@ class SymbolStrategyState:
         # LONG side
         if got_low:
             near_lower = pivot_loc <= self.p.ext_band_pct
-            bull = combine(bull_div_pine(), bull_div_cvd())
+            pine_ok = bull_div_pine()
+            cvd_ok = bull_div_cvd()
+            bull = combine(pine_ok, cvd_ok)
             if near_lower and bull:
                 entry = bar.close  # tradable entry at confirmation bar close
                 slip = bps(pivot_bar.low, entry)
@@ -160,8 +162,12 @@ class SymbolStrategyState:
                 signal = Signal(
                     symbol=self.symbol, side="LONG",
                     entry_price=entry, pivot_price=pivot_bar.low,
+                    pivot_osc_value=pivot_osc_pine,
+                    pivot_cvd_value=pivot_cvd if self.enable_cvd else None,
                     slip_bps=slip, loc_at_pivot=pivot_loc,
                     oscillator_name=osc_name,
+                    pine_div=pine_ok,
+                    cvd_div=cvd_ok,
                     pivot_time_ms=pivot_bar.open_time_ms,
                     confirm_time_ms=bar.close_time_ms
                 )
@@ -174,7 +180,9 @@ class SymbolStrategyState:
         # SHORT side
         if got_high:
             near_upper = pivot_loc >= (1.0 - self.p.ext_band_pct)
-            bear = combine(bear_div_pine(), bear_div_cvd())
+            pine_ok = bear_div_pine()
+            cvd_ok = bear_div_cvd()
+            bear = combine(pine_ok, cvd_ok)
             if near_upper and bear:
                 entry = bar.close
                 slip = bps(pivot_bar.high, entry)
@@ -182,8 +190,12 @@ class SymbolStrategyState:
                 signal = Signal(
                     symbol=self.symbol, side="SHORT",
                     entry_price=entry, pivot_price=pivot_bar.high,
+                    pivot_osc_value=pivot_osc_pine,
+                    pivot_cvd_value=pivot_cvd if self.enable_cvd else None,
                     slip_bps=slip, loc_at_pivot=pivot_loc,
                     oscillator_name=osc_name,
+                    pine_div=pine_ok,
+                    cvd_div=cvd_ok,
                     pivot_time_ms=pivot_bar.open_time_ms,
                     confirm_time_ms=bar.close_time_ms
                 )

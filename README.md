@@ -28,6 +28,7 @@ cp .env.example .env
 ```
 
 ### 3) Run in paper mode first
+Set `run.mode: paper` in `configs/default.yaml` before this step if you want a dry run (default in this repo is live).
 ```bash
 python -m div_donchian_bot.cli --config configs/default.yaml
 ```
@@ -36,12 +37,12 @@ python -m div_donchian_bot.cli --config configs/default.yaml
 In `configs/default.yaml` set:
 ```yaml
 run:
-  mode: live
+  mode: live   # default is live here; set to paper if you want a dry run
 ```
 Then run the same command.
 
 ## Running live on a VM (testnet=false)
-- Set `run.mode: live` (default is paper) and `exchange.testnet: false`.
+- Set `run.mode: live` (default is live in this repo) and `exchange.testnet: false`.
 - Populate `.env` with real Binance keys and Telegram bot/chat IDs if alerts are enabled.
 - Auto-restart on crashes/disconnects:
   - bash (Linux/macOS/git-bash): `RESTART_DELAY=5 ./scripts/run_bot.sh configs/default.yaml`
@@ -57,6 +58,7 @@ Default is **USDT-M Futures**.
 In `configs/default.yaml`:
 ```yaml
 strategy:
+  direction: both  # both | long_only | short_only
   divergence:
     mode: pine      # pine (default) | cvd | both | either
 ```
@@ -84,6 +86,11 @@ You can:
 
 Per-symbol overrides live in `configs/pairs/<SYMBOL>.yaml`.
 `universe.pair_overrides_dir` (default `configs/pairs`) controls where overrides are loaded from, even when using dynamic universes.
+- Dynamic universes are capped via `universe.max_symbols` (default 20 here) to avoid runaway stream subscriptions. Keep `allow_bases` small or use explicit symbols if you need tighter control.
+- Trade direction filter (under `strategy.direction`):
+  - `both` (default): allow LONG and SHORT
+  - `long_only`: block SHORT signals
+  - `short_only`: block LONG signals
 
 ## Corporate Telegram alerts
 - Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.
@@ -97,15 +104,16 @@ Per-symbol overrides live in `configs/pairs/<SYMBOL>.yaml`.
   ```
   <b>📌 TRADE SIGNAL — ENTRY</b>
   <pre>
-  Symbol: BTCUSDT        TF: 15m       Mode: PAPER
-  Side:   LONG           Div: PINE     Time: 2025-12-26 10:15:00Z
+  SYM: BTCUSDT     | SIDE: LONG | TIME: 2025-12-26 10:15:00Z
+  MODE: PAPER | TF: 15m | NET: n/a
   </pre>
 
   <b>Signal</b>
   <pre>
-  Entry:  105432.10
-  Pivot:  105120.00      Slip: +29.6 bps
-  Loc@P:  0.072          DonLen: 120   PivotLen: 5   ExtBand: 0.10
+  Entry: 105432.10 | Pivot: 105120.00 | Slip: +29.6 bps
+  DivMode: PINE | Pine: True | CVD: False
+  PivotOsc: 12.345600
+  Loc@Pivot: 0.072 | DonLen: 120 | PivotLen: 5 | ExtBand: 0.10
   </pre>
   ```
 
@@ -126,6 +134,32 @@ Per-symbol overrides live in `configs/pairs/<SYMBOL>.yaml`.
 ## Tests
 - Install dev deps: `python -m pip install -r requirements-dev.txt`
 - Run: `pytest`
+
+## Deployment (systemd template)
+```
+[Unit]
+Description=Pivot Div Donchian Bot
+After=network-online.target
+
+[Service]
+Type=simple
+User=YOURUSER
+WorkingDirectory=/opt/pivot-div-donchian-bot
+EnvironmentFile=/opt/pivot-div-donchian-bot/.env
+ExecStart=/opt/pivot-div-donchian-bot/.venv/bin/python -m div_donchian_bot.cli --config /opt/pivot-div-donchian-bot/configs/default.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+Enable and start:
+```
+sudo systemctl daemon-reload
+sudo systemctl enable pivot-div-donchian.service
+sudo systemctl start pivot-div-donchian.service
+sudo journalctl -u pivot-div-donchian.service -f --no-pager
+```
 
 ## Troubleshooting
 - `ModuleNotFoundError: No module named 'div_donchian_bot'`: run `python -m pip install -e .` to put the package on your `PYTHONPATH`, or set `PYTHONPATH=src` when invoking the CLI.

@@ -19,6 +19,7 @@ async def build_symbol_universe(cfg: Dict[str, Any], rest: BinanceRest) -> List[
 
     allow_bases = [x.upper() for x in (u.get("allow_bases", []) or [])]
     quote_asset = (u.get("quote_asset", "USDT") or "USDT").upper()
+    max_symbols = int(u.get("max_symbols", 0) or 0)
 
     info = await rest.exchange_info()
     out = []
@@ -36,6 +37,11 @@ async def build_symbol_universe(cfg: Dict[str, Any], rest: BinanceRest) -> List[
         if "contractType" in s and s.get("contractType") not in (None, "PERPETUAL"):
             continue
         out.append(sym)
+        if max_symbols and len(out) >= max_symbols:
+            break
 
-    log.info("Universe: dynamic symbols=%d (quote=%s allow_bases=%s)", len(out), quote_asset, allow_bases or "ALL")
+    log.info(
+        "Universe: dynamic symbols=%d (quote=%s allow_bases=%s max=%s)",
+        len(out), quote_asset, allow_bases or "ALL", max_symbols or "NONE"
+    )
     return out

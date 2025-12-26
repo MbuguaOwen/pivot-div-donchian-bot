@@ -17,7 +17,7 @@ class CsvStore:
         if not self.events_csv.exists():
             with self.events_csv.open("w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=[
-                    "ts_ms","symbol","side","entry_price","pivot_price","slip_bps","loc_at_pivot","oscillator","pivot_time_ms","confirm_time_ms"
+                    "ts_ms","symbol","side","entry_price","pivot_price","pivot_osc","pivot_cvd","slip_bps","loc_at_pivot","oscillator","pine_div","cvd_div","pivot_time_ms","confirm_time_ms"
                 ])
                 w.writeheader()
         if not self.trades_csv.exists():
@@ -30,7 +30,7 @@ class CsvStore:
     def log_event(self, d: Dict[str, Any]) -> None:
         with self.events_csv.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
-                "ts_ms","symbol","side","entry_price","pivot_price","slip_bps","loc_at_pivot","oscillator","pivot_time_ms","confirm_time_ms"
+                "ts_ms","symbol","side","entry_price","pivot_price","pivot_osc","pivot_cvd","slip_bps","loc_at_pivot","oscillator","pine_div","cvd_div","pivot_time_ms","confirm_time_ms"
             ])
             w.writerow(d)
 

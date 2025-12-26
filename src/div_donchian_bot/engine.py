@@ -67,6 +67,8 @@ class BotEngine:
         self.heartbeat_sec = int(tg_cfg.get("heartbeat_seconds", cfg["run"].get("heartbeat_seconds", 30)))
         self.heartbeat_enabled = bool(tg_cfg.get("heartbeat_enabled", True))
         self.pair_overrides_dir = (cfg.get("universe", {}) or {}).get("pair_overrides_dir", "configs/pairs")
+        strat_cfg = cfg.get("strategy", {}) or {}
+        self.direction_filter = str(strat_cfg.get("direction", "both")).lower()
         self.heartbeat_sec = int(
             (cfg.get("telegram", {}) or {}).get(
                 "heartbeat_seconds",
@@ -104,6 +106,7 @@ class BotEngine:
         if self.mode == "live" and (not rest.key or not rest.secret):
             self._live_enabled = False
             await self.notifier.send(formatters.format_error(self.branding, "LIVE DISABLED: missing keys", RuntimeError("missing BINANCE_API_KEY/SECRET")))
+            raise RuntimeError("LIVE DISABLED: missing BINANCE_API_KEY/SECRET")
 
         await self.notifier.start()
 
@@ -126,6 +129,7 @@ class BotEngine:
         kline_streams = [f"{s.lower()}@kline_{tf}" for s in symbols]
         trade_streams = [f"{s.lower()}@aggTrade" for s in symbols if self.symbol_cfgs[s].enable_cvd]
         all_streams = kline_streams + trade_streams
+        log.info("Streams: kline=%d aggTrade=%d cvd_symbols=%d", len(kline_streams), len(trade_streams), len(cvd_symbols))
 
         # Chunk streams to avoid overloading a single connection.
         # Binance allows many streams, but be conservative: 200 per connection.
@@ -153,6 +157,7 @@ class BotEngine:
                 max_positions_total=self.max_positions_total,
                 cooldown_minutes=self.cooldown_minutes,
                 heartbeat_sec=self.heartbeat_sec,
+                direction=self.direction_filter,
             )
         )
 
@@ -260,6 +265,13 @@ class BotEngine:
         sig = rt.strat.on_bar_close(bar)
         if not sig:
             return
+        # Direction filter
+        if self.direction_filter == "long_only" and sig.side == "SHORT":
+            log.info("Blocked by direction filter: SHORT (direction=long_only)")
+            return
+        if self.direction_filter == "short_only" and sig.side == "LONG":
+            log.info("Blocked by direction filter: LONG (direction=short_only)")
+            return
 
         now_ms = int(time.time() * 1000)
         cooldown_ms = self.cooldown_minutes * 60 * 1000
@@ -275,26 +287,46 @@ class BotEngine:
             "side": sig.side,
             "entry_price": sig.entry_price,
             "pivot_price": sig.pivot_price,
+            "pivot_osc": sig.pivot_osc_value,
+            "pivot_cvd": sig.pivot_cvd_value,
             "slip_bps": sig.slip_bps,
             "loc_at_pivot": sig.loc_at_pivot,
             "oscillator": sig.oscillator_name,
+            "pine_div": sig.pine_div,
+            "cvd_div": sig.cvd_div,
             "pivot_time_ms": sig.pivot_time_ms,
             "confirm_time_ms": sig.confirm_time_ms,
         })
 
+        orders_cfg = scfg.orders_cfg
+        notional = float(orders_cfg.get("notional_usdt", 25.0))
+        planned_qty = None
+        filters = None
+        try:
+            if self.rest:
+                filters = await self.rest.get_symbol_filters(sig.symbol)
+                planned_qty = quantize(notional / sig.entry_price, filters.step_size)
+        except Exception:
+            planned_qty = None
+            filters = None
+
         # Telegram alert ALWAYS (pre-trade)
         await self.notifier.send(
-            formatters.format_entry_signal(
+            formatters.format_entry(
                 branding=self.branding,
                 sig=sig,
                 atr=atr,
                 strat_params=scfg.strategy_params,
+                atr_params=scfg.atr_params,
                 divergence_mode=scfg.divergence_mode,
                 timeframe=self.timeframe,
+                testnet=self.testnet,
                 mode=self.mode,
                 cooldown_minutes=self.cooldown_minutes,
                 max_positions_total=self.max_positions_total,
                 one_pos_per_symbol=scfg.position_cfg.get("one_position_per_symbol", True),
+                notional_usdt=notional,
+                planned_qty=planned_qty,
             )
         )
 
@@ -309,22 +341,19 @@ class BotEngine:
 
         assert self.rest is not None
         # Leverage (futures)
-        orders_cfg = scfg.orders_cfg
         lev = int(orders_cfg.get("leverage", 1))
         await self.rest.set_leverage(sig.symbol, lev)
 
         # Determine quantity from notional
-        notional = float(orders_cfg.get("notional_usdt", 25.0))
-        # Use current close for sizing
-        px = sig.entry_price
-        qty_raw = notional / px
-        f = await self.rest.get_symbol_filters(sig.symbol)
-        qty = quantize(qty_raw, f.step_size)
+        if filters is None:
+            filters = await self.rest.get_symbol_filters(sig.symbol)
+        qty_raw = notional / sig.entry_price
+        qty = quantize(qty_raw, filters.step_size)
         levels = atr_levels(sig.side, sig.entry_price, atr, scfg.atr_params)
-        if qty < f.min_qty:
-            err = RuntimeError(f"Qty too small for {sig.symbol}: {qty} < min {f.min_qty}")
+        if qty < filters.min_qty:
+            err = RuntimeError(f"Qty too small for {sig.symbol}: {qty} < min {filters.min_qty}")
             await self.notifier.send(
-                formatters.format_execution_result(
+                formatters.format_execution(
                     branding=self.branding,
                     sig=sig,
                     order={"orderId": "n/a", "status": "REJECTED"},
@@ -332,7 +361,8 @@ class BotEngine:
                     qty=qty,
                     leverage=lev,
                     notional=notional,
-                    atr_enabled=scfg.atr_params.enabled,
+                    atr_params=scfg.atr_params,
+                    atr_value=atr,
                     error=err,
                 )
             )
@@ -350,8 +380,8 @@ class BotEngine:
                 # For futures, exit sides are opposite
                 exit_side = "SELL" if sig.side == "LONG" else "BUY"
                 # Quantize prices to tick
-                sl = round(levels.sl / f.tick_size) * f.tick_size
-                tp = round(levels.tp / f.tick_size) * f.tick_size
+                sl = round(levels.sl / filters.tick_size) * filters.tick_size
+                tp = round(levels.tp / filters.tick_size) * filters.tick_size
                 await self.rest.order_stop_market(sig.symbol, side=exit_side, qty=qty, stop_price=sl, reduce_only=True)
                 await self.rest.order_take_profit_market(sig.symbol, side=exit_side, qty=qty, stop_price=tp, reduce_only=True)
 
@@ -360,7 +390,7 @@ class BotEngine:
         except Exception as e:
             log.warning("Execution failed for %s: %s", sig.symbol, e)
             await self.notifier.send(
-                formatters.format_execution_result(
+                formatters.format_execution(
                     branding=self.branding,
                     sig=sig,
                     order=order or {"orderId": "n/a", "status": "ERROR"},
@@ -368,7 +398,8 @@ class BotEngine:
                     qty=qty,
                     leverage=lev,
                     notional=notional,
-                    atr_enabled=scfg.atr_params.enabled,
+                    atr_params=scfg.atr_params,
+                    atr_value=atr,
                     error=e,
                 )
             )
@@ -388,7 +419,7 @@ class BotEngine:
         })
 
         await self.notifier.send(
-            formatters.format_execution_result(
+            formatters.format_execution(
                 branding=self.branding,
                 sig=sig,
                 order=order,
@@ -396,6 +427,7 @@ class BotEngine:
                 qty=qty,
                 leverage=lev,
                 notional=notional,
-                atr_enabled=scfg.atr_params.enabled,
+                atr_params=scfg.atr_params,
+                atr_value=atr,
             )
         )

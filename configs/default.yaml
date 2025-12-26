@@ -1,5 +1,5 @@
 run:
-  mode: paper         # paper | live
+  mode: live         # paper | live
   timeframe: "15m"
   heartbeat_seconds: 30
 
@@ -12,12 +12,14 @@ universe:
   dynamic: true
   quote_asset: "USDT"
   pair_overrides_dir: "configs/pairs"
+  max_symbols: 20       # cap dynamic selection to avoid runaway subscriptions
   # If non-empty, dynamic universe will keep only symbols whose base is in this list
-  allow_bases: ["BTC","ETH","SOL","XRP","BNB","TRX"]   # edit freely
+  allow_bases: ["BTC","ETH","SOL","XRP","BNB","TRX","ADA","AVAX"]   # edit freely
   # If you want explicit symbols instead of dynamic:
   symbols: []   # e.g. ["BTCUSDT","ETHUSDT"]
 
 strategy:
+  direction: "both"   # both | long_only | short_only
   donchian:
     length: 120
     extreme_band_pct: 0.10

@@ -39,6 +39,10 @@ class TelegramNotifier:
             await self.start()
             if not self.enabled:
                 return
+        # Telegram limit ~4096 chars
+        if len(text) > 4096:
+            suffix = "... [truncated]"
+            text = text[: 4096 - len(suffix)] + suffix
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {
             "chat_id": self.chat_id,

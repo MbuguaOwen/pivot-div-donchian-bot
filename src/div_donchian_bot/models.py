@@ -20,9 +20,13 @@ class Signal:
     side: Side
     entry_price: float
     pivot_price: float
+    pivot_osc_value: float
+    pivot_cvd_value: Optional[float]
     slip_bps: float
     loc_at_pivot: float
     oscillator_name: str
+    pine_div: bool
+    cvd_div: bool
     pivot_time_ms: int
     confirm_time_ms: int
 
