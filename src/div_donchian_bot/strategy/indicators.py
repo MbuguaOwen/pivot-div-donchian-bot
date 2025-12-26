@@ -1,26 +1,46 @@
 from __future__ import annotations
 from collections import deque
-from dataclasses import dataclass
-from typing import Deque, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Deque, Optional, Tuple, Literal
 import math
+
+EmaSeedMode = Literal["first", "sma"]
 
 @dataclass
 class EmaState:
     length: int
+    seed_mode: EmaSeedMode = "first"
     value: Optional[float] = None
+    _seed_buffer: Deque[float] = field(default_factory=deque, init=False)
 
     def update(self, x: float) -> float:
+        """Update EMA with configurable seeding.
+
+        seed_mode:
+          - first: first sample initializes EMA (previous behavior)
+          - sma: seed with SMA of the first N samples before switching to EMA
+        """
         alpha = 2.0 / (self.length + 1.0)
+        if self.value is None and self.seed_mode == "sma":
+            self._seed_buffer.append(x)
+            if len(self._seed_buffer) < self.length:
+                # Return running mean until we have full seed window
+                return sum(self._seed_buffer) / len(self._seed_buffer)
+            self.value = sum(self._seed_buffer) / self.length
+            self._seed_buffer.clear()
+            return self.value
+
         if self.value is None:
             self.value = x
-        else:
-            self.value = alpha * x + (1.0 - alpha) * self.value
+            return self.value
+
+        self.value = alpha * x + (1.0 - alpha) * self.value
         return self.value
 
 class AtrState:
-    def __init__(self, length: int):
+    def __init__(self, length: int, ema_seed_mode: EmaSeedMode = "first"):
         self.length = length
-        self.ema = EmaState(length)
+        self.ema = EmaState(length, seed_mode=ema_seed_mode)
         self.prev_close: Optional[float] = None
 
     def update(self, high: float, low: float, close: float) -> float:

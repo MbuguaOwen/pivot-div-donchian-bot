@@ -42,6 +42,16 @@ class SymbolConfig:
     orders_cfg: Dict[str, Any]
     position_cfg: Dict[str, Any]
     divergence_mode: str
+    parity: ParityConfig
+
+@dataclass
+class ParityConfig:
+    mode: bool = False
+    ema_seed_mode: str = "first"
+    pivot_tie_break: str = "strict"
+    warmup_bars: int = 0
+    gap_heal: bool = True
+    desync_pause: bool = True
 
 @dataclass
 class SymbolRuntime:
@@ -50,6 +60,9 @@ class SymbolRuntime:
     atr: AtrState
     in_position: bool = False
     last_signal_ts_ms: int = 0
+    last_bar_open_ms: Optional[int] = None
+    desynced: bool = False
+    desync_warned: bool = False
 
 class BotEngine:
     def __init__(self, cfg: Dict[str, Any]):
@@ -72,6 +85,15 @@ class BotEngine:
         strat_cfg = cfg.get("strategy", {}) or {}
         self.direction_default = str(strat_cfg.get("direction", "both")).lower()
         self.direction_gate = DirectionGate(self.direction_default)
+        parity_cfg = cfg.get("parity", {}) or {}
+        self.parity_cfg = ParityConfig(
+            mode=bool(parity_cfg.get("mode", False)),
+            ema_seed_mode=str(parity_cfg.get("ema_seed_mode", "first")).lower(),
+            pivot_tie_break=str(parity_cfg.get("pivot_tie_break", "strict")).lower(),
+            warmup_bars=int(parity_cfg.get("warmup_bars", 0) or 0),
+            gap_heal=bool(parity_cfg.get("gap_heal", True)),
+            desync_pause=bool(parity_cfg.get("desync_pause", True)),
+        )
         self.controls: Optional[TelegramControls] = None
         self.controls_enabled = bool(tg_cfg.get("controls_enabled", False))
         self.controls_allowed_chat_id = tg_cfg.get("controls_allowed_chat_id")
@@ -91,6 +113,7 @@ class BotEngine:
         self._start_time = time.time()
         self._live_enabled = True
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._sent_alert_keys: set[tuple[str, str, int, str]] = set()
 
     async def start(self, rest: BinanceRest, ws_url: str, symbols: List[str]) -> None:
         self.rest = rest
@@ -98,7 +121,11 @@ class BotEngine:
         self._start_time = time.time()
         limits = self.cfg.get("limits", {}) or {}
         self.max_positions_total = int(limits.get("max_positions_total", 20))
-        self.cooldown_minutes = int(limits.get("cooldown_minutes_per_symbol", 30))
+        default_cooldown = int(limits.get("cooldown_minutes_per_symbol", 30))
+        if self.parity_cfg.mode:
+            self.cooldown_minutes = int(limits.get("cooldown_minutes_per_symbol", 0))
+        else:
+            self.cooldown_minutes = default_cooldown
 
         self.orders_cfg = self.cfg.get("orders", {}) or {}
         self.position_cfg = self.cfg.get("position", {}) or {}
@@ -142,6 +169,11 @@ class BotEngine:
                 strat=SymbolStrategyState(sym, scfg.strategy_params, enable_cvd=scfg.enable_cvd),
                 atr=AtrState(scfg.atr_params.length),
             )
+        for sym in symbols:
+            try:
+                await self._warmup_symbol(sym, self.symbols_rt[sym])
+            except Exception as e:
+                log.warning("Warmup failed for %s: %s", sym, e)
 
         # Build streams
         tf = self.timeframe
@@ -188,12 +220,22 @@ class BotEngine:
         merged = deep_merge(self.cfg, override)
         s_cfg = merged.get("strategy", {}) or {}
         divergence_mode = str(s_cfg.get("divergence", {}).get("mode", "pine")).lower()
+        ema_seed_mode = self.parity_cfg.ema_seed_mode if self.parity_cfg.mode else "first"
+        pivot_tie_break = self.parity_cfg.pivot_tie_break if self.parity_cfg.mode else "strict"
+        don_len = int(s_cfg["donchian"]["length"])
+        pivot_len = int(s_cfg["pivot"]["length"])
+        osc_len = int(s_cfg["oscillator"]["ema_length"])
+        base_warmup = max(don_len, 5 * osc_len, 3 * (2 * pivot_len + 1)) + 2
+        warmup_bars = max(self.parity_cfg.warmup_bars, base_warmup) if self.parity_cfg.mode else 0
         p = StrategyParams(
-            don_len=int(s_cfg["donchian"]["length"]),
+            don_len=don_len,
             ext_band_pct=float(s_cfg["donchian"]["extreme_band_pct"]),
-            pivot_len=int(s_cfg["pivot"]["length"]),
-            osc_ema_len=int(s_cfg["oscillator"]["ema_length"]),
+            pivot_len=pivot_len,
+            osc_ema_len=osc_len,
             divergence_mode=divergence_mode,
+            ema_seed_mode=ema_seed_mode,
+            pivot_tie_break=pivot_tie_break,
+            warmup_bars=warmup_bars,
         )
         enable_cvd = divergence_mode in ("cvd", "both", "either")
 
@@ -217,7 +259,37 @@ class BotEngine:
             orders_cfg=orders_cfg,
             position_cfg=position_cfg,
             divergence_mode=divergence_mode,
+            parity=self.parity_cfg,
         )
+
+    def _suggest_warmup(self, params: StrategyParams) -> int:
+        base = max(
+            params.don_len,
+            5 * params.osc_ema_len,
+            3 * (2 * params.pivot_len + 1),
+        )
+        return base + 2  # small safety margin
+
+    async def _warmup_symbol(self, symbol: str, rt: SymbolRuntime) -> None:
+        if not self.parity_cfg.mode:
+            return
+        if self.rest is None:
+            return
+        target = max(rt.cfg.strategy_params.warmup_bars, self._suggest_warmup(rt.cfg.strategy_params))
+        if target <= 0:
+            return
+        try:
+            bars = await self.rest.fetch_last_n_bars(symbol, self.timeframe, target)
+        except Exception as e:
+            log.warning("Warmup fetch failed for %s: %s", symbol, e)
+            return
+        now_ms = int(time.time() * 1000)
+        closed = [b for b in bars if b.close_time_ms <= now_ms]
+        for b in closed[-target:]:
+            await self._on_bar_close(symbol, b, heal_gaps=False, emit_alerts=False)
+            rt.last_bar_open_ms = b.open_time_ms
+        if closed:
+            rt.last_bar_open_ms = closed[-1].open_time_ms
 
     async def stop(self) -> None:
         if self.ws:
@@ -248,6 +320,58 @@ class BotEngine:
                     uptime_seconds=uptime,
                 )
             )
+
+    def _signal_key(self, sig: Signal) -> tuple[str, str, int, str]:
+        return (sig.symbol, self.timeframe, sig.confirm_time_ms, sig.side)
+
+    def _log_signal_suppressed(self, sig: Signal, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {
+            "reason": reason,
+            "symbol": sig.symbol,
+            "side": sig.side,
+            "confirm_time_ms": sig.confirm_time_ms,
+            "pivot_time_ms": sig.pivot_time_ms,
+        }
+        if extra:
+            payload.update(extra)
+        log.info("signal_suppressed %s", payload)
+
+    async def _heal_if_gap(self, symbol: str, rt: SymbolRuntime, incoming: Bar, emit_alerts: bool) -> None:
+        """Backfill missing klines if websocket skipped bars."""
+        if not self.parity_cfg.mode or not self.parity_cfg.gap_heal:
+            return
+        last_open = rt.last_bar_open_ms
+        if last_open is None:
+            return
+        tf_ms = _tf_to_minutes(self.timeframe) * 60 * 1000
+        expected_open = last_open + tf_ms
+        if incoming.open_time_ms <= expected_open:
+            return
+        missing = int((incoming.open_time_ms - expected_open) // tf_ms)
+        if missing <= 0:
+            return
+        fillers: List[Bar] = []
+        try:
+            if self.rest:
+                history = await self.rest.fetch_last_n_bars(symbol, self.timeframe, missing + 2)
+                fillers = [b for b in history if expected_open <= b.open_time_ms < incoming.open_time_ms]
+                fillers.sort(key=lambda x: x.open_time_ms)
+        except Exception as e:
+            log.warning("Gap heal fetch failed for %s: %s", symbol, e)
+        if len(fillers) < missing:
+            rt.desynced = True
+            if self.parity_cfg.desync_pause and emit_alerts and not rt.desync_warned:
+                warn = f"Desynced for {symbol}: missing {missing} bars before {incoming.open_time_ms}"
+                try:
+                    await self.notifier.send(warn)
+                except Exception:
+                    log.warning("Failed to send desync notice for %s", symbol)
+                rt.desync_warned = True
+            return
+        for fb in fillers:
+            await self._on_bar_close(symbol, fb, heal_gaps=False, emit_alerts=emit_alerts)
+        rt.desynced = False
+        rt.desync_warned = False
 
     async def _on_ws_message(self, msg: dict) -> None:
         # Combined stream format: {"stream":"btcusdt@kline_15m","data":{...}}
@@ -280,8 +404,11 @@ class BotEngine:
             is_buyer_maker = bool(data.get("m"))
             self.symbols_rt[sym].strat.on_agg_trade(ts, qty, is_buyer_maker)
 
-    async def _on_bar_close(self, symbol: str, bar: Bar) -> None:
+    async def _on_bar_close(self, symbol: str, bar: Bar, heal_gaps: bool = True, emit_alerts: bool = True) -> None:
         rt = self.symbols_rt[symbol]
+        if heal_gaps:
+            await self._heal_if_gap(symbol, rt, bar, emit_alerts)
+        rt.last_bar_open_ms = bar.open_time_ms
         scfg = rt.cfg
         # update ATR
         atr = rt.atr.update(bar.high, bar.low, bar.close)
@@ -289,21 +416,33 @@ class BotEngine:
         sig = rt.strat.on_bar_close(bar)
         if not sig:
             return
+        if rt.desynced and self.parity_cfg.desync_pause and emit_alerts:
+            self._log_signal_suppressed(sig, "desynced_state")
+            return
+        if not emit_alerts:
+            return
+        key = self._signal_key(sig)
+        if key in self._sent_alert_keys:
+            self._log_signal_suppressed(sig, "duplicate", {"idempotency_key": key})
+            return
+
         # Direction filter
         direction = self.direction_gate.get_direction()
         if direction == "long_only" and sig.side == "SHORT":
-            log.info("Blocked by direction filter: SHORT (direction=long_only)")
+            self._log_signal_suppressed(sig, "direction_filter", {"direction": direction})
             return
         if direction == "short_only" and sig.side == "LONG":
-            log.info("Blocked by direction filter: LONG (direction=short_only)")
+            self._log_signal_suppressed(sig, "direction_filter", {"direction": direction})
             return
 
         now_ms = int(time.time() * 1000)
         cooldown_ms = self.cooldown_minutes * 60 * 1000
         if (now_ms - rt.last_signal_ts_ms) < cooldown_ms:
+            self._log_signal_suppressed(sig, "cooldown", {"cooldown_ms": cooldown_ms})
             return
         rt.last_signal_ts_ms = now_ms
         self._last_signal_ts_ms = now_ms
+        self._sent_alert_keys.add(key)
 
         # Log signal
         self.store.log_event({

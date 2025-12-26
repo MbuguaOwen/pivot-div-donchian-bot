@@ -92,6 +92,29 @@ Per-symbol overrides live in `configs/pairs/<SYMBOL>.yaml`.
   - `long_only`: block SHORT signals
   - `short_only`: block LONG signals
 
+## TradingView Parity Mode
+- Enable in `configs/default.yaml` (or per-env override):
+  ```yaml
+  parity:
+    mode: true
+    ema_seed_mode: "sma"        # "sma" matches Pine ta.ema seeding
+    pivot_tie_break: "tv_like"  # deterministic flat-top/flat-bottom selection
+    warmup_bars: 0              # 0 = auto-compute (don/pivot/ema safety margin)
+    gap_heal: true              # REST backfill on missed klines
+    desync_pause: true          # pause alerts + warn if a gap cannot be healed
+  ```
+- Matching TV chart: same symbol string (spot vs perp), identical timeframe, `fireOnClose=true` alerts only.
+- Parity check harness (offline):
+  ```bash
+  python -m div_donchian_bot.cli.parity_check \
+    --bars_csv artifacts/my_ohlcv.csv \
+    --tv_signals_csv artifacts/tv_signals.csv \
+    --config configs/default.yaml
+  ```
+  Output includes precision/recall, missing/extra signals, and the first mismatch timestamp.
+- Exporting TV alerts: use your TradingView alert log export (CSV) with columns `symbol,side,confirm_time_ms` (millisecond close timestamp). For bars, use your own OHLCV export; the bot assumes close-time ordering and bar-close semantics only.
+- Known limits: CVD parity is best-effort (depends on aggTrade availability); if REST backfill fails, the engine will pause alerts for that symbol until healed.
+
 ## Corporate Telegram alerts
 - Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.
 - Config toggles in `configs/default.yaml`:

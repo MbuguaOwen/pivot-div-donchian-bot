@@ -52,12 +52,24 @@ class TelegramNotifier:
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        # Basic rate limit: serialize sends
+        # Basic rate limit + retries
         async with self._lock:
-            try:
-                async with self._session.post(url, json=payload, timeout=20) as r:
-                    if r.status != 200:
+            delay = 1.0
+            attempts = 0
+            last_err: Optional[Exception] = None
+            while attempts < 3:
+                attempts += 1
+                try:
+                    async with self._session.post(url, json=payload, timeout=10) as r:
+                        if r.status == 200:
+                            return
                         body = await r.text()
-                        log.warning("Telegram send failed: %s %s", r.status, body[:500])
-            except Exception as e:
-                log.exception("Telegram send error: %s", e)
+                        last_err = RuntimeError(f"HTTP {r.status}: {body[:500]}")
+                        log.warning("Telegram send failed (attempt %s): %s", attempts, last_err)
+                except Exception as e:
+                    last_err = e
+                    log.warning("Telegram send exception (attempt %s): %s", attempts, e)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+            if last_err:
+                log.error("Telegram send exhausted retries: %s", last_err)

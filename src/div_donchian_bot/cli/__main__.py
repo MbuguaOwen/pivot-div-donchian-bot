@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import logging
 
 from dotenv import load_dotenv
 
-from .config import load_config
-from .logging_setup import setup_logging
-from .binance.endpoints import endpoints
-from .binance.rest import BinanceRest
-from .universe import build_symbol_universe
-from .engine import BotEngine
+from ..config import load_config
+from ..logging_setup import setup_logging
+from ..binance.endpoints import endpoints
+from ..binance.rest import BinanceRest
+from ..universe import build_symbol_universe
+from ..engine import BotEngine
 
 log = logging.getLogger("cli")
+
 
 async def main_async(cfg_path: str) -> None:
     load_dotenv()
@@ -46,11 +46,13 @@ async def main_async(cfg_path: str) -> None:
     finally:
         await engine.stop()
 
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Path to YAML config (e.g. configs/default.yaml)")
     args = ap.parse_args()
     asyncio.run(main_async(args.config))
+
 
 if __name__ == "__main__":
     main()

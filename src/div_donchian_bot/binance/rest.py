@@ -7,10 +7,12 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlencode
 
 import aiohttp
+
+from ..models import Bar
 
 log = logging.getLogger("binance.rest")
 
@@ -194,6 +196,26 @@ class BinanceRest:
             "workingType": "CONTRACT_PRICE",
         }
         return await self._request("POST", "/fapi/v1/order", params, signed=True)
+
+    async def fetch_last_n_bars(self, symbol: str, interval: str, limit: int) -> List[Bar]:
+        """Fetch the latest closed klines for warmup/backfill."""
+        limit = max(1, min(int(limit), 1000))
+        if self.market_type == "futures":
+            data = await self._request("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        else:
+            data = await self._request("GET", "/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        bars: List[Bar] = []
+        for row in data:
+            bars.append(Bar(
+                open_time_ms=int(row[0]),
+                open=float(row[1]),
+                high=float(row[2]),
+                low=float(row[3]),
+                close=float(row[4]),
+                volume=float(row[5]),
+                close_time_ms=int(row[6]),
+            ))
+        return bars
 
 def quantize(x: float, step: float) -> float:
     if step <= 0:

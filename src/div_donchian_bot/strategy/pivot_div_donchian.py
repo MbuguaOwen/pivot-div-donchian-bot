@@ -4,9 +4,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Optional, List, Literal
 
+import logging
+
 from ..models import Bar, Signal
-from .indicators import EmaState, AtrState, donchian, loc_in_range, bps
-from .pivot import is_pivot_low, is_pivot_high
+from .indicators import EmaState, AtrState, donchian, loc_in_range, bps, EmaSeedMode
+from .pivot import is_pivot_low, is_pivot_high, PivotTieBreak
 
 DivergenceMode = Literal["pine","cvd","both","either"]
 
@@ -17,6 +19,11 @@ class StrategyParams:
     pivot_len: int
     osc_ema_len: int
     divergence_mode: DivergenceMode
+    ema_seed_mode: EmaSeedMode = "first"
+    pivot_tie_break: PivotTieBreak = "strict"
+    warmup_bars: int = 0
+
+log = logging.getLogger("strategy.pivot_div_donchian")
 
 class SymbolStrategyState:
     def __init__(self, symbol: str, params: StrategyParams, enable_cvd: bool):
@@ -25,7 +32,7 @@ class SymbolStrategyState:
         self.enable_cvd = enable_cvd
 
         self.bars: Deque[Bar] = deque(maxlen=max(2000, params.don_len + 2*params.pivot_len + 50))
-        self.osc_ema = EmaState(params.osc_ema_len)
+        self.osc_ema = EmaState(params.osc_ema_len, seed_mode=params.ema_seed_mode)
         self.osc_vals: Deque[float] = deque(maxlen=self.bars.maxlen)
 
         self.don_hi: Deque[float] = deque(maxlen=self.bars.maxlen)
@@ -46,6 +53,28 @@ class SymbolStrategyState:
 
         self.last_pl_cvd: Optional[float] = None
         self.last_ph_cvd: Optional[float] = None
+
+    def _log_suppressed(self, bar: Bar, reason: str, extra: Optional[dict] = None) -> None:
+        if not log.isEnabledFor(logging.DEBUG):
+            return
+        payload = {
+            "symbol": self.symbol,
+            "reason": reason,
+            "bar_close_ms": bar.close_time_ms,
+            "warmup_needed": self.p.warmup_bars,
+            "bars_seen": len(self.bars),
+        }
+        if extra:
+            payload.update(extra)
+        log.debug("signal_suppressed %s", payload)
+
+    def _log_signal(self, side: str, payload: dict) -> None:
+        if not log.isEnabledFor(logging.DEBUG):
+            return
+        data = dict(payload)
+        data["side"] = side
+        data["decision"] = "signal"
+        log.debug("signal_fired %s", data)
 
     def on_agg_trade(self, ts_ms: int, qty: float, is_buyer_maker: bool) -> None:
         """Update delta for current 15m bar.
@@ -101,23 +130,46 @@ class SymbolStrategyState:
         # Need enough bars for pivot confirmation window
         L = len(self.bars)
         pl = self.p.pivot_len
+        if L < max(self.p.warmup_bars, 0):
+            self._log_suppressed(bar, "warmup")
+            return None
         if L < (2*pl + 1):
+            self._log_suppressed(bar, "pivot_window")
             return None
 
         # Confirm pivots at index mid = L-1-pl (pivot occurs pl bars ago)
         mid = L - 1 - pl
         highs_list = [b.high for b in self.bars]
         lows_list  = [b.low for b in self.bars]
+        don_hi_series = list(self.don_hi)
+        don_lo_series = list(self.don_lo)
 
         # Grab pivot bar values (equivalent to Pine: low[pivotLen], osc[pivotLen], loc[pivotLen])
         pivot_bar = list(self.bars)[mid]
         pivot_osc_pine = list(self.osc_vals)[mid]
         pivot_loc = list(self.loc)[mid]
         pivot_cvd = list(self.cvd_vals)[mid] if self.enable_cvd else float("nan")
+        pivot_state = {
+            "symbol": self.symbol,
+            "pivot_index": mid,
+            "pivot_time_ms": pivot_bar.open_time_ms,
+            "confirm_time_ms": bar.close_time_ms,
+            "pivot_low": pivot_bar.low,
+            "pivot_high": pivot_bar.high,
+            "pivot_osc": pivot_osc_pine,
+            "pivot_cvd": pivot_cvd if self.enable_cvd else None,
+            "pivot_loc": pivot_loc,
+            "don_hi": don_hi_series[mid] if mid < len(don_hi_series) else None,
+            "don_lo": don_lo_series[mid] if mid < len(don_lo_series) else None,
+            "last_pl_price": self.last_pl_price,
+            "last_pl_osc": self.last_pl_osc,
+            "last_ph_price": self.last_ph_price,
+            "last_ph_osc": self.last_ph_osc,
+        }
 
         # Determine if a pivot is confirmed now
-        got_low = is_pivot_low(lows_list, mid, pl)
-        got_high = is_pivot_high(highs_list, mid, pl)
+        got_low = is_pivot_low(lows_list, mid, pl, tie_break=self.p.pivot_tie_break)
+        got_high = is_pivot_high(highs_list, mid, pl, tie_break=self.p.pivot_tie_break)
 
         signal: Optional[Signal] = None
 
@@ -171,6 +223,19 @@ class SymbolStrategyState:
                     pivot_time_ms=pivot_bar.open_time_ms,
                     confirm_time_ms=bar.close_time_ms
                 )
+                self._log_signal("LONG", {
+                    **pivot_state,
+                    "pine_div": pine_ok,
+                    "cvd_div": cvd_ok,
+                    "near_band": near_lower,
+                })
+            else:
+                self._log_suppressed(bar, "pivot_low_reject", {
+                    **pivot_state,
+                    "pine_div": pine_ok,
+                    "cvd_div": cvd_ok,
+                    "near_band": near_lower,
+                })
             # Update last confirmed pivot low state (as Pine does)
             self.last_pl_price = pivot_bar.low
             self.last_pl_osc = pivot_osc_pine
@@ -199,9 +264,25 @@ class SymbolStrategyState:
                     pivot_time_ms=pivot_bar.open_time_ms,
                     confirm_time_ms=bar.close_time_ms
                 )
+                self._log_signal("SHORT", {
+                    **pivot_state,
+                    "pine_div": pine_ok,
+                    "cvd_div": cvd_ok,
+                    "near_band": near_upper,
+                })
+            else:
+                self._log_suppressed(bar, "pivot_high_reject", {
+                    **pivot_state,
+                    "pine_div": pine_ok,
+                    "cvd_div": cvd_ok,
+                    "near_band": near_upper,
+                })
             self.last_ph_price = pivot_bar.high
             self.last_ph_osc = pivot_osc_pine
             if self.enable_cvd:
                 self.last_ph_cvd = pivot_cvd
+
+        if not got_low and not got_high:
+            self._log_suppressed(bar, "no_pivot", pivot_state)
 
         return signal

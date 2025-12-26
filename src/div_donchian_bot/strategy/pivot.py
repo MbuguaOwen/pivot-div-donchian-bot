@@ -1,8 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Literal, List
+from typing import Literal, List
 
 PivotType = Literal["LOW","HIGH"]
+PivotTieBreak = Literal["strict","tv_like"]
 
 @dataclass
 class Pivot:
@@ -13,23 +14,24 @@ class Pivot:
     loc: float
     pivot_time_ms: int # bar open time of pivot bar
 
-def is_pivot_low(lows: List[float], idx: int, left_right: int) -> bool:
+def is_pivot_low(lows: List[float], idx: int, left_right: int, tie_break: PivotTieBreak = "strict") -> bool:
     start = idx - left_right
     end = idx + left_right
     if start < 0 or end >= len(lows):
         return False
     window = lows[start:end+1]
     m = min(window)
-    # Strict: pivot must be strictly lower than all others in window
     if lows[idx] != m:
         return False
-    # If any other bar shares the min, reject
-    for j in range(start, end + 1):
-        if j != idx and lows[j] == m:
-            return False
-    return True
+    indices = [j for j in range(start, end + 1) if lows[j] == m]
+    if tie_break == "strict":
+        return len(indices) == 1
+    if tie_break == "tv_like":
+        # Deterministic: choose leftmost extremum inside the confirmation window
+        return idx == indices[0]
+    raise ValueError(f"Unknown tie_break: {tie_break}")
 
-def is_pivot_high(highs: List[float], idx: int, left_right: int) -> bool:
+def is_pivot_high(highs: List[float], idx: int, left_right: int, tie_break: PivotTieBreak = "strict") -> bool:
     start = idx - left_right
     end = idx + left_right
     if start < 0 or end >= len(highs):
@@ -38,7 +40,9 @@ def is_pivot_high(highs: List[float], idx: int, left_right: int) -> bool:
     m = max(window)
     if highs[idx] != m:
         return False
-    for j in range(start, end + 1):
-        if j != idx and highs[j] == m:
-            return False
-    return True
+    indices = [j for j in range(start, end + 1) if highs[j] == m]
+    if tie_break == "strict":
+        return len(indices) == 1
+    if tie_break == "tv_like":
+        return idx == indices[0]
+    raise ValueError(f"Unknown tie_break: {tie_break}")
