@@ -1,0 +1,72 @@
+run:
+  mode: paper         # paper | live
+  timeframe: "15m"
+  heartbeat_seconds: 30
+
+exchange:
+  market_type: futures # futures | spot
+  testnet: false
+  recv_window_ms: 5000
+
+universe:
+  dynamic: true
+  quote_asset: "USDT"
+  pair_overrides_dir: "configs/pairs"
+  # If non-empty, dynamic universe will keep only symbols whose base is in this list
+  allow_bases: ["BTC","ETH","SOL","XRP","BNB","TRX"]   # edit freely
+  # If you want explicit symbols instead of dynamic:
+  symbols: []   # e.g. ["BTCUSDT","ETHUSDT"]
+
+strategy:
+  donchian:
+    length: 120
+    extreme_band_pct: 0.10
+  pivot:
+    length: 5
+  oscillator:
+    ema_length: 14
+  divergence:
+    # pine (default): EMA((close-open)*volume, oscLen)
+    # cvd: bar-close CVD (from aggTrades)
+    # both: require pine AND cvd divergence to agree
+    # either: pine OR cvd divergence
+    mode: "pine"
+  fire_on_close_only: true
+
+risk:
+  atr:
+    enabled: false
+    length: 14
+    sl_mult: 2.0
+    tp_mult: 3.0
+
+orders:
+  # Position sizing: simplest is fixed notional in USDT (converted to quantity).
+  notional_usdt: 25.0
+  # For futures you can also set leverage (bot will try to set it)
+  leverage: 3
+  # Market orders are simplest/most robust
+  order_type: MARKET
+
+position:
+  one_position_per_symbol: true
+  allow_flip: false        # if true, closes and reverses on opposite signal
+
+limits:
+  max_positions_total: 20
+  cooldown_minutes_per_symbol: 30
+
+telegram:
+  enabled: true
+  parse_mode: "HTML"
+  branding: "Pivot Div + Donchian"
+  heartbeat_enabled: true
+  # Optional: override heartbeat interval (seconds) for Telegram status pings.
+  # Defaults to run.heartbeat_seconds if unset.
+  heartbeat_seconds: 14400
+
+storage:
+  out_dir: "artifacts"
+
+logging:
+  level: "${LOG_LEVEL:INFO}"
