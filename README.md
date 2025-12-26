@@ -100,6 +100,10 @@ Per-symbol overrides live in `configs/pairs/<SYMBOL>.yaml`.
   - `telegram.branding`: optional title for headers/footers.
   - `telegram.heartbeat_enabled`: enable/disable heartbeat pings (defaults to true).
   - `telegram.heartbeat_seconds`: override heartbeat interval (falls back to `run.heartbeat_seconds`).
+  - `telegram.controls_enabled`: enable inline buttons to switch direction at runtime (off by default; no polling otherwise).
+  - `telegram.controls_allowed_chat_id`: restrict control clicks (defaults to `TELEGRAM_CHAT_ID`).
+  - `telegram.controls_state_path`: file to persist last update id + direction to avoid replay on restart.
+- When controls are enabled, the startup alert includes inline buttons (LONG ONLY / SHORT ONLY / BOTH); only the allowed chat_id is honored.
 - Alert layout uses `<b>` + `<pre>` for aligned fields. Example (HTML rendered by Telegram):
   ```
   <b>📌 TRADE SIGNAL — ENTRY</b>

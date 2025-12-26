@@ -19,6 +19,8 @@ from .binance.rest import BinanceRest, quantize
 from .binance.ws import BinanceWsManager
 from .config import deep_merge, load_pair_override
 from .alerts import formatters
+from .direction import DirectionGate
+from .telegram_controls import TelegramControls, control_keyboard
 
 log = logging.getLogger("engine")
 
@@ -68,13 +70,12 @@ class BotEngine:
         self.heartbeat_enabled = bool(tg_cfg.get("heartbeat_enabled", True))
         self.pair_overrides_dir = (cfg.get("universe", {}) or {}).get("pair_overrides_dir", "configs/pairs")
         strat_cfg = cfg.get("strategy", {}) or {}
-        self.direction_filter = str(strat_cfg.get("direction", "both")).lower()
-        self.heartbeat_sec = int(
-            (cfg.get("telegram", {}) or {}).get(
-                "heartbeat_seconds",
-                cfg["run"].get("heartbeat_seconds", 30),
-            )
-        )
+        self.direction_default = str(strat_cfg.get("direction", "both")).lower()
+        self.direction_gate = DirectionGate(self.direction_default)
+        self.controls: Optional[TelegramControls] = None
+        self.controls_enabled = bool(tg_cfg.get("controls_enabled", False))
+        self.controls_allowed_chat_id = tg_cfg.get("controls_allowed_chat_id")
+        self.controls_state_path = tg_cfg.get("controls_state_path", "state/telegram_controls.json")
 
         self.rest: Optional[BinanceRest] = None
         self.ws: Optional[BinanceWsManager] = None
@@ -109,6 +110,25 @@ class BotEngine:
             raise RuntimeError("LIVE DISABLED: missing BINANCE_API_KEY/SECRET")
 
         await self.notifier.start()
+        if self.controls_enabled and self.enable_telegram:
+            allowed_chat = self.controls_allowed_chat_id
+            if allowed_chat is None:
+                try:
+                    allowed_chat = int(self.notifier.chat_id)
+                except Exception:
+                    allowed_chat = None
+            if allowed_chat is None:
+                log.warning("Telegram controls enabled but no allowed_chat_id; controls not started")
+            else:
+                self.controls = TelegramControls(
+                    token=self.notifier.token,
+                    allowed_chat_id=allowed_chat,
+                    state_path=self.controls_state_path,
+                    gate=self.direction_gate,
+                    notifier_send=self.notifier.send,
+                    parse_mode=self.parse_mode,
+                )
+                await self.controls.start()
 
         # Build per-symbol runtime/config
         cvd_symbols: List[str] = []
@@ -143,6 +163,7 @@ class BotEngine:
         if self.heartbeat_enabled:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
+        startup_markup = control_keyboard() if self.controls_enabled else None
         await self.notifier.send(
             formatters.format_startup(
                 branding=self.branding,
@@ -157,8 +178,9 @@ class BotEngine:
                 max_positions_total=self.max_positions_total,
                 cooldown_minutes=self.cooldown_minutes,
                 heartbeat_sec=self.heartbeat_sec,
-                direction=self.direction_filter,
-            )
+                direction=self.direction_gate.get_direction(),
+            ),
+            reply_markup=startup_markup,
         )
 
     def _build_symbol_config(self, symbol: str) -> SymbolConfig:
@@ -203,6 +225,8 @@ class BotEngine:
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
+        if self.controls:
+            await self.controls.stop()
         await self.notifier.stop()
         if self.rest:
             await self.rest.stop()
@@ -266,10 +290,11 @@ class BotEngine:
         if not sig:
             return
         # Direction filter
-        if self.direction_filter == "long_only" and sig.side == "SHORT":
+        direction = self.direction_gate.get_direction()
+        if direction == "long_only" and sig.side == "SHORT":
             log.info("Blocked by direction filter: SHORT (direction=long_only)")
             return
-        if self.direction_filter == "short_only" and sig.side == "LONG":
+        if direction == "short_only" and sig.side == "LONG":
             log.info("Blocked by direction filter: LONG (direction=short_only)")
             return
 

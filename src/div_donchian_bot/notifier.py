@@ -32,7 +32,7 @@ class TelegramNotifier:
             await self._session.close()
             self._session = None
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str, reply_markup: Optional[dict] = None) -> None:
         if not self.enabled:
             return
         if not self._session:
@@ -50,6 +50,8 @@ class TelegramNotifier:
             "disable_web_page_preview": True,
             "parse_mode": self.parse_mode,
         }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         # Basic rate limit: serialize sends
         async with self._lock:
             try:

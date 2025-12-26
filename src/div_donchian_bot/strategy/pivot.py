@@ -20,7 +20,14 @@ def is_pivot_low(lows: List[float], idx: int, left_right: int) -> bool:
         return False
     window = lows[start:end+1]
     m = min(window)
-    return lows[idx] == m
+    # Strict: pivot must be strictly lower than all others in window
+    if lows[idx] != m:
+        return False
+    # If any other bar shares the min, reject
+    for j in range(start, end + 1):
+        if j != idx and lows[j] == m:
+            return False
+    return True
 
 def is_pivot_high(highs: List[float], idx: int, left_right: int) -> bool:
     start = idx - left_right
@@ -29,4 +36,9 @@ def is_pivot_high(highs: List[float], idx: int, left_right: int) -> bool:
         return False
     window = highs[start:end+1]
     m = max(window)
-    return highs[idx] == m
+    if highs[idx] != m:
+        return False
+    for j in range(start, end + 1):
+        if j != idx and highs[j] == m:
+            return False
+    return True

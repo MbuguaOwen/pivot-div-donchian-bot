@@ -66,6 +66,10 @@ telegram:
   # Optional: override heartbeat interval (seconds) for Telegram status pings.
   # Defaults to run.heartbeat_seconds if unset.
   heartbeat_seconds: 14400
+  controls_enabled: false
+  # If unset, will use TELEGRAM_CHAT_ID from env
+  controls_allowed_chat_id: null
+  controls_state_path: "state/telegram_controls.json"
 
 storage:
   out_dir: "artifacts"
