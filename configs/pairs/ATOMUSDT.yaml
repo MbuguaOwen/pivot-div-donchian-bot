@@ -1,0 +1,18 @@
+# Overrides for ATOMUSDT
+strategy:
+  donchian:
+    length: 120
+    extreme_band_pct: 0.10
+  pivot:
+    length: 5
+  oscillator:
+    ema_length: 14
+risk:
+  atr:
+    enabled: false
+    length: 14
+    sl_mult: 2.0
+    tp_mult: 3.0
+orders:
+  notional_usdt: 25.0
+  leverage: 3

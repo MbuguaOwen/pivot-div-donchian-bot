@@ -9,14 +9,32 @@ exchange:
   recv_window_ms: 5000
 
 universe:
-  dynamic: true
+  dynamic: false
   quote_asset: "USDT"
   pair_overrides_dir: "configs/pairs"
   max_symbols: 20       # cap dynamic selection to avoid runaway subscriptions
-  # If non-empty, dynamic universe will keep only symbols whose base is in this list
-  allow_bases: ["BTC","ETH","SOL","XRP","BNB","TRX","ADA","AVAX"]   # edit freely
-  # If you want explicit symbols instead of dynamic:
-  symbols: []   # e.g. ["BTCUSDT","ETHUSDT"]
+  allow_bases: []   # ignored when dynamic=false
+  symbols:
+    - XRPUSDT
+    - ADAUSDT
+    - DOGEUSDT
+    - TRXUSDT
+    - LINKUSDT
+    - DOTUSDT
+    - AVAXUSDT
+    - LTCUSDT
+    - ATOMUSDT
+    - NEARUSDT
+    - UNIUSDT
+    - BCHUSDT
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+    - BNBUSDT
+    - XLMUSDT
+    - OPUSDT
+    - ARBUSDT
+    - APTUSDT
 
 strategy:
   direction: "both"   # both | long_only | short_only
