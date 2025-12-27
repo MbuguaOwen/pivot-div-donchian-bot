@@ -64,20 +64,50 @@ strategy:
 ```
 ⚠️ CVD requires subscribing to **aggTrades**, which is bandwidth-heavy for a huge symbol set. The bot only opens aggTrade streams for symbols whose divergence mode needs it; prefer a curated symbol list when enabling CVD.
 
-## ATR SL/TP (disabled by default)
-In `configs/default.yaml`:
+## HTF structure risk engine
+Single risk engine (no separate ATR SL/TP module). In `configs/default.yaml`:
 ```yaml
 risk:
-  atr:
-    enabled: false
-    length: 14
-    sl_mult: 2.0
-    tp_mult: 3.0
+  engine:
+    enabled: true
+    htf_interval: "1h"
+    htf_lookback_bars: 72
+    buffer_bps: 10
+    atr_len: 24
+    k_init: 1.8
+    tp_r_mult: 2.0
+    be_trigger_r: 1.0
+    be_buffer_bps: 10
+    trailing:
+      enabled: false
+      trigger_r: 2.5
+      k_trail: 1.6
+      lock_r: 1.0
+    min_stop_replace_interval_sec: 2
+    min_stop_tick_improvement: 2
 ```
+- SL0: structure low/high ± buffer, capped by `k_init * ATR(1h,24)` (closer stop wins).
+- R = |entry − SL0|; TP = entry ± `tp_r_mult * R` (default 2R).
+- Break-even at `be_trigger_r` with `be_buffer_bps` buffer; stop is monotonic.
+- Trailing (optional): trigger at `trailing.trigger_r`, lock at `lock_r * R`, trail by `max(k_trail * ATR(1h,24), (trigger_r-lock_r)*R)`.
+- Entries are refused until the HTF engine is warmed up; SL is placed before TP, and a failed SL placement triggers an immediate flatten.
 
-When enabled, the bot places (Futures) protective orders:
-- `STOP_MARKET` for SL
-- `TAKE_PROFIT_MARKET` for TP
+## Execution modes (paper vs binance)
+- Config block:
+  ```yaml
+  execution:
+    mode: paper   # paper | binance
+    paper:
+      fee_bps: 4.0           # per-side fees
+      slippage_bps: 1.5      # applied on fills/exits against you
+      fill_policy: next_tick # next_tick | bar_close_fallback
+      max_wait_ms: 3000      # fallback deadline for bar_close_fallback
+      use_mark_price: false
+      log_trades: true
+  ```
+- `paper`: uses live mainnet websockets, no signed REST, local fills (next aggTrade tick) with slippage/fees, internal SL/TP + stop-engine exits. No API keys required.
+- `binance`: current live behavior (signed REST orders, positionRisk watchdog, stop cancel/replace throttled).
+- Telegram execution messages show the EXEC mode and fill px/fees; exits in paper mode are announced as `(paper)`.
 
 ## Configuring many pairs
 You can:

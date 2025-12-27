@@ -17,7 +17,22 @@ def base_cfg(tmp_path: Path) -> dict:
             "divergence": {"mode": "pine"},
             "fire_on_close_only": True,
         },
-        "risk": {"atr": {"enabled": False, "length": 14, "sl_mult": 2.0, "tp_mult": 3.0}},
+        "risk": {
+            "engine": {
+                "enabled": True,
+                "htf_interval": "1h",
+                "htf_lookback_bars": 72,
+                "atr_len": 24,
+                "k_init": 1.8,
+                "tp_r_mult": 2.0,
+                "buffer_bps": 10,
+                "be_trigger_r": 1.0,
+                "be_buffer_bps": 10,
+                "trailing": {"enabled": False, "trigger_r": 2.5, "k_trail": 1.6, "lock_r": 1.0},
+                "min_stop_replace_interval_sec": 2,
+                "min_stop_tick_improvement": 2,
+            }
+        },
         "orders": {"notional_usdt": 25.0, "leverage": 3, "order_type": "MARKET"},
         "position": {"one_position_per_symbol": True, "allow_flip": False},
         "limits": {"max_positions_total": 20, "cooldown_minutes_per_symbol": 30},

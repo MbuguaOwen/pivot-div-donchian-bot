@@ -1,12 +1,21 @@
 run:
   mode: live         # paper | live
-  timeframe: "15m"
-  heartbeat_seconds: 30
+  timeframe: "1h"
 
 exchange:
   market_type: futures # futures | spot
   testnet: false
   recv_window_ms: 5000
+
+execution:
+  mode: paper   # paper | binance
+  paper:
+    fee_bps: 4.0
+    slippage_bps: 1.5
+    fill_policy: next_tick   # next_tick | bar_close_fallback
+    max_wait_ms: 3000
+    use_mark_price: false
+    log_trades: true
 
 universe:
   dynamic: false
@@ -62,11 +71,34 @@ parity:
   desync_pause: true
 
 risk:
-  atr:
-    enabled: false
-    length: 14
-    sl_mult: 2.0
-    tp_mult: 3.0
+  engine:
+    enabled: true
+
+    # 1) Structure stop
+    htf_interval: "1h"
+    htf_lookback_bars: 72
+    buffer_bps: 10          # structure buffer
+
+    # 2) Cap stop if structure is huge
+    atr_len: 24
+    k_init: 20.8             # cap = 1.8 * ATR(1h,24)
+
+    # 3) Fixed RR take-profit
+    tp_r_mult: 2.0          # TP = 2R
+
+    # 4) Break-even
+    be_trigger_r: 1.0
+    be_buffer_bps: 10
+
+    # 5) Optional trailing (OFF by default)
+    trailing:
+      enabled: false
+      trigger_r: 2.5
+      k_trail: 1.6
+      lock_r: 1.0
+
+    min_stop_replace_interval_sec: 2
+    min_stop_tick_improvement: 2
 
 orders:
   # Position sizing: simplest is fixed notional in USDT (converted to quantity).
@@ -91,7 +123,7 @@ telegram:
   heartbeat_enabled: true
   # Optional: override heartbeat interval (seconds) for Telegram status pings.
   # Defaults to run.heartbeat_seconds if unset.
-  heartbeat_seconds: 14400
+  heartbeat_seconds: 43200
   controls_enabled: false
   # If unset, will use TELEGRAM_CHAT_ID from env
   controls_allowed_chat_id: null

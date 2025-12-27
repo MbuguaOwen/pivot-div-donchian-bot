@@ -1,28 +1,56 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Deque
 
 from dotenv import load_dotenv
 
-from .models import Bar, Signal
+from .models import Bar, Signal, Side
 from .notifier import TelegramNotifier
 from .storage.csv_store import CsvStore
 from .strategy.pivot_div_donchian import StrategyParams, SymbolStrategyState
-from .risk.atr_risk import AtrRiskParams, atr_levels
 from .strategy.indicators import AtrState
-from .binance.rest import BinanceRest, quantize
+from .risk.structure_atr_trailing import (
+    StructureAtrTrailParams,
+    TrailingParams,
+    StopState,
+    compute_initial_sl,
+    compute_tp_from_R,
+    update_extremes,
+    update_stop,
+)
+from .binance.rest import BinanceRest, SymbolFilters, quantize
 from .binance.ws import BinanceWsManager
+from .execution.base import ExecutionAdapter, ExecFill
+from .execution.paper import PaperExecutor, PaperConfig
+from .execution.binance_exec import BinanceExecutor
 from .config import deep_merge, load_pair_override
 from .alerts import formatters
 from .direction import DirectionGate
 from .telegram_controls import TelegramControls, control_keyboard
 
 log = logging.getLogger("engine")
+
+def floor_to_tick(px: float, tick: float) -> float:
+    return math.floor(px / tick) * tick if tick > 0 else px
+
+
+def ceil_to_tick(px: float, tick: float) -> float:
+    return math.ceil(px / tick) * tick if tick > 0 else px
+
+
+def quantize_sl(px: float, side: Side, tick: float) -> float:
+    return floor_to_tick(px, tick) if side == "LONG" else ceil_to_tick(px, tick)
+
+
+def quantize_tp(px: float, side: Side, tick: float) -> float:
+    return ceil_to_tick(px, tick) if side == "LONG" else floor_to_tick(px, tick)
 
 def _tf_to_minutes(tf: str) -> int:
     tf = tf.strip().lower()
@@ -37,7 +65,7 @@ class SymbolConfig:
     symbol: str
     cfg: Dict[str, Any]
     strategy_params: StrategyParams
-    atr_params: AtrRiskParams
+    stop_engine_params: StructureAtrTrailParams
     enable_cvd: bool
     orders_cfg: Dict[str, Any]
     position_cfg: Dict[str, Any]
@@ -57,7 +85,18 @@ class ParityConfig:
 class SymbolRuntime:
     cfg: SymbolConfig
     strat: SymbolStrategyState
-    atr: AtrState
+    h1_atr: Optional[AtrState] = None
+    h1_bars: Optional[Deque[Bar]] = None
+    h1_atr_value: Optional[float] = None
+    stop_state: Optional[StopState] = None
+    stop_ready: bool = False
+    position_side: Optional[Side] = None
+    position_qty: Optional[float] = None
+    stop_order_id: Optional[str] = None
+    tp_order_id: Optional[str] = None
+    filters: Optional[SymbolFilters] = None
+    last_stop_replace_ms: Optional[int] = None
+    pending_signal: Optional[Signal] = None
     in_position: bool = False
     last_signal_ts_ms: int = 0
     last_bar_open_ms: Optional[int] = None
@@ -70,6 +109,9 @@ class BotEngine:
 
         self.cfg = cfg
         self.config_dir = Path(cfg.get("_config_dir", "."))
+        exec_cfg = cfg.get("execution", {}) or {}
+        self.exec_mode = str(exec_cfg.get("mode", "binance")).lower()
+        self.paper_cfg = exec_cfg.get("paper", {}) or {}
         self.mode = cfg["run"]["mode"]
         self.timeframe = cfg["run"].get("timeframe", "15m")
         self.enable_telegram = bool(cfg.get("telegram", {}).get("enabled", True))
@@ -101,6 +143,7 @@ class BotEngine:
 
         self.rest: Optional[BinanceRest] = None
         self.ws: Optional[BinanceWsManager] = None
+        self.executor: Optional[ExecutionAdapter] = None
         self.notifier = TelegramNotifier(enabled=self.enable_telegram, parse_mode=self.parse_mode)
         self.store = CsvStore(cfg.get("storage", {}).get("out_dir", "artifacts"))
 
@@ -113,6 +156,7 @@ class BotEngine:
         self._start_time = time.time()
         self._live_enabled = True
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._position_watchdog_task: Optional[asyncio.Task] = None
         self._sent_alert_keys: set[tuple[str, str, int, str]] = set()
 
     async def start(self, rest: BinanceRest, ws_url: str, symbols: List[str]) -> None:
@@ -128,8 +172,8 @@ class BotEngine:
         self.orders_cfg = self.cfg.get("orders", {}) or {}
         self.position_cfg = self.cfg.get("position", {}) or {}
 
-        # live safety: refuse trading without keys
-        if self.mode == "live" and (not rest.key or not rest.secret):
+        # live safety: refuse trading without keys only when executing on binance
+        if self.exec_mode == "binance" and self.mode == "live" and (not rest.key or not rest.secret):
             self._live_enabled = False
             await self.notifier.send(formatters.format_error(self.branding, "LIVE DISABLED: missing keys", RuntimeError("missing BINANCE_API_KEY/SECRET")))
             raise RuntimeError("LIVE DISABLED: missing BINANCE_API_KEY/SECRET")
@@ -157,29 +201,76 @@ class BotEngine:
 
         # Build per-symbol runtime/config
         cvd_symbols: List[str] = []
+        stop_engine_symbols: List[str] = []
         for sym in symbols:
             scfg = self._build_symbol_config(sym)
             self.symbol_cfgs[sym] = scfg
             if scfg.enable_cvd:
                 cvd_symbols.append(sym)
+            if scfg.stop_engine_params.enabled:
+                stop_engine_symbols.append(sym)
+                h1_maxlen = scfg.stop_engine_params.htf_lookback_bars + scfg.stop_engine_params.atr_len + 5
+                h1_bars: Optional[Deque[Bar]] = deque(maxlen=h1_maxlen)
+                h1_atr = AtrState(scfg.stop_engine_params.atr_len, ema_seed_mode=self.parity_cfg.ema_seed_mode if self.parity_cfg.mode else "first")
+            else:
+                h1_bars = None
+                h1_atr = None
             self.symbols_rt[sym] = SymbolRuntime(
                 cfg=scfg,
                 strat=SymbolStrategyState(sym, scfg.strategy_params, enable_cvd=scfg.enable_cvd),
-                atr=AtrState(scfg.atr_params.length),
+                h1_atr=h1_atr,
+                h1_bars=h1_bars,
             )
+
         for sym in symbols:
             try:
                 await self._warmup_symbol(sym, self.symbols_rt[sym])
             except Exception as e:
                 log.warning("Warmup failed for %s: %s", sym, e)
+            try:
+                await self._warmup_stop_engine(sym, self.symbols_rt[sym])
+            except Exception as e:
+                log.warning("Stop-engine warmup failed for %s: %s", sym, e)
+
+        # Execution adapter
+        if self.exec_mode == "paper":
+            pcfg = PaperConfig(
+                fee_bps=float(self.paper_cfg.get("fee_bps", 4.0)),
+                slippage_bps=float(self.paper_cfg.get("slippage_bps", 1.5)),
+                fill_policy=str(self.paper_cfg.get("fill_policy", "next_tick")),
+                max_wait_ms=int(self.paper_cfg.get("max_wait_ms", 3000)),
+                use_mark_price=bool(self.paper_cfg.get("use_mark_price", False)),
+                log_trades=bool(self.paper_cfg.get("log_trades", True)),
+            )
+            self.executor = PaperExecutor(pcfg, on_exit=self._on_paper_exit, on_fill=self._on_paper_fill)
+        else:
+            self.executor = BinanceExecutor(self.rest)
+        await self.executor.start()
 
         # Build streams
         tf = self.timeframe
         # Binance expects lowercase, e.g. btcusdt@kline_15m
         kline_streams = [f"{s.lower()}@kline_{tf}" for s in symbols]
-        trade_streams = [f"{s.lower()}@aggTrade" for s in symbols if self.symbol_cfgs[s].enable_cvd]
-        all_streams = kline_streams + trade_streams
-        log.info("Streams: kline=%d aggTrade=%d cvd_symbols=%d", len(kline_streams), len(trade_streams), len(cvd_symbols))
+        h1_streams = [
+            f"{s.lower()}@kline_{self.symbol_cfgs[s].stop_engine_params.htf_interval}"
+            for s in symbols
+            if self.symbol_cfgs[s].stop_engine_params.enabled
+        ]
+        trade_streams = [
+            f"{s.lower()}@aggTrade"
+            for s in symbols
+            if self.symbol_cfgs[s].enable_cvd or self.symbol_cfgs[s].stop_engine_params.enabled or self.exec_mode == "paper"
+        ]
+        # Deduplicate while preserving order
+        all_streams = list(dict.fromkeys(kline_streams + h1_streams + trade_streams))
+        log.info(
+            "Streams: kline=%d htf=%d aggTrade=%d cvd_symbols=%d stop_engine=%d",
+            len(kline_streams),
+            len(h1_streams),
+            len(trade_streams),
+            len(cvd_symbols),
+            len(stop_engine_symbols),
+        )
 
         # Chunk streams to avoid overloading a single connection.
         # Binance allows many streams, but be conservative: 200 per connection.
@@ -192,19 +283,22 @@ class BotEngine:
         # Heartbeat
         if self.heartbeat_enabled:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if self.exec_mode == "binance" and self.mode == "live":
+            self._position_watchdog_task = asyncio.create_task(self._position_watchdog_loop())
 
         startup_markup = control_keyboard() if self.controls_enabled else None
         await self.notifier.send(
             formatters.format_startup(
                 branding=self.branding,
                 mode=self.mode,
+                exec_mode=self.exec_mode,
                 testnet=self.testnet,
                 exchange="Binance",
                 market_type=self.market_type,
                 timeframe=self.timeframe,
                 symbols=symbols,
                 cvd_symbols=cvd_symbols,
-                atr_enabled=bool(self.cfg.get("risk", {}).get("atr", {}).get("enabled", False)),
+                stop_engine_enabled=bool(self.cfg.get("risk", {}).get("engine", {}).get("enabled", False)),
                 max_positions_total=self.max_positions_total,
                 cooldown_minutes=self.cooldown_minutes,
                 heartbeat_sec=self.heartbeat_sec,
@@ -237,12 +331,27 @@ class BotEngine:
         )
         enable_cvd = divergence_mode in ("cvd", "both", "either")
 
-        r_cfg = merged.get("risk", {}).get("atr", {})
-        atr_params = AtrRiskParams(
-            enabled=bool(r_cfg.get("enabled", False)),
-            length=int(r_cfg.get("length", 14)),
-            sl_mult=float(r_cfg.get("sl_mult", 2.0)),
-            tp_mult=float(r_cfg.get("tp_mult", 3.0)),
+        # risk.engine config block
+        risk_cfg = merged.get("risk", {}).get("engine", {}) or {}
+        trailing_cfg = risk_cfg.get("trailing", {}) or {}
+        stop_engine_params = StructureAtrTrailParams(
+            enabled=bool(risk_cfg.get("enabled", False)),
+            htf_interval=str(risk_cfg.get("htf_interval", "1h")).lower(),
+            htf_lookback_bars=int(risk_cfg.get("htf_lookback_bars", 72)),
+            atr_len=int(risk_cfg.get("atr_len", 24)),
+            k_init=float(risk_cfg.get("k_init", 1.8)),
+            tp_r_mult=float(risk_cfg.get("tp_r_mult", 2.0)),
+            buffer_bps=float(risk_cfg.get("buffer_bps", 10.0)),
+            be_trigger_r=float(risk_cfg.get("be_trigger_r", 1.0)),
+            be_buffer_bps=float(risk_cfg.get("be_buffer_bps", 10.0)),
+            trailing=TrailingParams(
+                enabled=bool(trailing_cfg.get("enabled", False)),
+                trigger_r=float(trailing_cfg.get("trigger_r", 2.5)),
+                k_trail=float(trailing_cfg.get("k_trail", 1.6)),
+                lock_r=float(trailing_cfg.get("lock_r", 1.0)),
+            ),
+            min_stop_replace_interval_sec=float(risk_cfg.get("min_stop_replace_interval_sec", 2.0)),
+            min_stop_tick_improvement=int(risk_cfg.get("min_stop_tick_improvement", 2)),
         )
 
         orders_cfg = merged.get("orders", {}) or {}
@@ -252,7 +361,7 @@ class BotEngine:
             symbol=symbol,
             cfg=merged,
             strategy_params=p,
-            atr_params=atr_params,
+            stop_engine_params=stop_engine_params,
             enable_cvd=enable_cvd,
             orders_cfg=orders_cfg,
             position_cfg=position_cfg,
@@ -289,17 +398,41 @@ class BotEngine:
         if closed:
             rt.last_bar_open_ms = closed[-1].open_time_ms
 
+    async def _warmup_stop_engine(self, symbol: str, rt: SymbolRuntime) -> None:
+        params = rt.cfg.stop_engine_params
+        if not params.enabled:
+            return
+        if self.rest is None or rt.h1_atr is None or rt.h1_bars is None:
+            return
+        target = params.htf_lookback_bars + params.atr_len + 5
+        try:
+            bars = await self.rest.fetch_last_n_bars(symbol, params.htf_interval, target)
+        except Exception as e:
+            log.warning("Stop-engine warmup fetch failed for %s: %s", symbol, e)
+            return
+        now_ms = int(time.time() * 1000)
+        closed = [b for b in bars if b.close_time_ms <= now_ms]
+        for b in closed[-target:]:
+            await self._on_h1_close(symbol, b, emit_alerts=False)
+        if len(rt.h1_bars) >= params.htf_lookback_bars and rt.h1_atr_value is not None:
+            rt.stop_ready = True
+
     async def stop(self) -> None:
         if self.ws:
             await self.ws.stop()
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
+        if self._position_watchdog_task:
+            self._position_watchdog_task.cancel()
+            self._position_watchdog_task = None
         if self.controls:
             await self.controls.stop()
         await self.notifier.stop()
         if self.rest:
             await self.rest.stop()
+        if self.executor:
+            await self.executor.stop()
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -371,6 +504,19 @@ class BotEngine:
         rt.desynced = False
         rt.desync_warned = False
 
+    async def _on_h1_close(self, symbol: str, bar: Bar, emit_alerts: bool = True) -> None:
+        rt = self.symbols_rt[symbol]
+        params = rt.cfg.stop_engine_params
+        if not params.enabled or rt.h1_atr is None or rt.h1_bars is None:
+            return
+        rt.h1_bars.append(bar)
+        rt.h1_atr_value = rt.h1_atr.update(bar.high, bar.low, bar.close)
+        if rt.stop_state:
+            update_extremes(rt.stop_state, high=bar.high, low=bar.low)
+        if len(rt.h1_bars) >= params.htf_lookback_bars and rt.h1_atr_value is not None:
+            rt.stop_ready = True
+        await self._maybe_update_stop(symbol, reason="ATR_UPDATE")
+
     async def _on_ws_message(self, msg: dict) -> None:
         # Combined stream format: {"stream":"btcusdt@kline_15m","data":{...}}
         data = msg.get("data") or {}
@@ -382,6 +528,7 @@ class BotEngine:
             sym = k.get("s")
             if not sym or sym not in self.symbols_rt:
                 return
+            interval = str(k.get("i"))
             bar = Bar(
                 open_time_ms=int(k["t"]),
                 open=float(k["o"]),
@@ -391,7 +538,10 @@ class BotEngine:
                 volume=float(k["v"]),
                 close_time_ms=int(k["T"]),
             )
-            await self._on_bar_close(sym, bar)
+            if interval == self.timeframe:
+                await self._on_bar_close(sym, bar)
+            elif interval == self.symbol_cfgs[sym].stop_engine_params.htf_interval:
+                await self._on_h1_close(sym, bar)
 
         elif e == "aggTrade":
             sym = data.get("s")
@@ -400,16 +550,269 @@ class BotEngine:
             ts = int(data.get("T"))
             qty = float(data.get("q"))
             is_buyer_maker = bool(data.get("m"))
-            self.symbols_rt[sym].strat.on_agg_trade(ts, qty, is_buyer_maker)
+            price = float(data.get("p"))
+            rt = self.symbols_rt[sym]
+            if self.executor:
+                await self.executor.on_trade_tick(sym, price, ts)
+            if rt.cfg.stop_engine_params.enabled and rt.stop_state:
+                update_extremes(rt.stop_state, price=price)
+                await self._maybe_update_stop(sym, reason="TICK")
+            if rt.cfg.enable_cvd:
+                rt.strat.on_agg_trade(ts, qty, is_buyer_maker)
+
+    async def _replace_stop_order(self, symbol: str, rt: SymbolRuntime, new_sl: float, reason: str, old_sl: float) -> None:
+        if rt.stop_state is None or rt.position_qty is None or self.executor is None:
+            return
+        tick = 0.0
+        if rt.filters:
+            tick = rt.filters.tick_size
+        elif self.rest:
+            try:
+                rt.filters = await self.rest.get_symbol_filters(symbol)
+                tick = rt.filters.tick_size
+            except Exception as e:
+                log.warning("Failed to fetch filters for stop replace %s: %s", symbol, e)
+                return
+        stop_price = quantize_sl(new_sl, rt.stop_state.side, tick)
+        if rt.stop_state.side == "LONG" and stop_price <= old_sl:
+            return
+        if rt.stop_state.side == "SHORT" and stop_price >= old_sl:
+            return
+        min_dt_ms = int(rt.cfg.stop_engine_params.min_stop_replace_interval_sec * 1000)
+        now_ms = int(time.time() * 1000)
+        if rt.last_stop_replace_ms and (now_ms - rt.last_stop_replace_ms) < min_dt_ms:
+            return
+        if rt.cfg.stop_engine_params.min_stop_tick_improvement > 0 and tick > 0:
+            ticks_moved = abs(stop_price - old_sl) / tick
+            if ticks_moved < rt.cfg.stop_engine_params.min_stop_tick_improvement:
+                return
+        try:
+            res = await self.executor.place_or_replace_stop(symbol, rt.stop_state.side, rt.position_qty, stop_price, reason=reason, tick_size=tick)
+            if res and res.ok:
+                if res.order_ids:
+                    new_stop_id = res.order_ids.get("stop")
+                else:
+                    new_stop_id = None
+                # cancel old stop only after new stop is confirmed
+                if self.exec_mode == "binance" and rt.stop_order_id and self.rest:
+                    try:
+                        await self.rest.cancel_order(symbol, rt.stop_order_id)
+                    except Exception as e:
+                        log.warning("stop_cancel_failed %s: %s", symbol, e)
+                rt.stop_order_id = new_stop_id or rt.stop_order_id
+                rt.stop_state.sl = stop_price
+                log.info(
+                    "stop_update symbol=%s side=%s reason=%s old_sl=%.8f new_sl=%.8f atr=%.8f peak=%.8f trough=%.8f",
+                    symbol,
+                    rt.stop_state.side,
+                    reason,
+                    old_sl,
+                    stop_price,
+                    rt.h1_atr_value or 0.0,
+                    rt.stop_state.peak,
+                    rt.stop_state.trough,
+                )
+                rt.last_stop_replace_ms = now_ms
+            else:
+                log.warning("stop_replace_failed %s: %s", symbol, res.msg if res else "no_result")
+        except Exception as e:
+            log.warning("stop_replace_failed %s: %s", symbol, e)
+
+    async def _maybe_update_stop(self, symbol: str, reason: str) -> None:
+        rt = self.symbols_rt[symbol]
+        params = rt.cfg.stop_engine_params
+        state = rt.stop_state
+        if not params.enabled or state is None or not rt.stop_ready:
+            return
+        if rt.h1_atr_value is None:
+            return
+        prev_be = state.be_done
+        prev_trailing = state.trailing_active
+        old_sl = state.sl
+        new_sl = update_stop(state, rt.h1_atr_value, params)
+        tightened = (state.side == "LONG" and new_sl > old_sl) or (state.side == "SHORT" and new_sl < old_sl)
+        reason_flag = None
+        if not prev_trailing and state.trailing_active and tightened:
+            reason_flag = "LOCK"
+        elif not prev_be and state.be_done and tightened:
+            reason_flag = "BE"
+        elif tightened:
+            reason_flag = "TRAIL"
+        if tightened:
+            await self._replace_stop_order(symbol, rt, new_sl, reason_flag or reason, old_sl)
+
+    async def _handle_stop_failure(self, sig: Signal, fill: ExecFill, scfg: SymbolConfig, stop_info: Dict[str, Any], reason: str) -> None:
+        err = RuntimeError(reason)
+        try:
+            await self.notifier.send(
+                formatters.format_execution(
+                    branding=self.branding,
+                    sig=sig,
+                    order={"orderId": "n/a", "status": "STOP_FAILED"},
+                    qty=fill.qty,
+                    leverage=scfg.orders_cfg.get("leverage", 1),
+                    notional=scfg.orders_cfg.get("notional_usdt", 25.0),
+                    exec_mode=self.exec_mode,
+                    error=err,
+                    stop_info=stop_info,
+                    fill=fill,
+                )
+            )
+        except Exception as e:
+            log.warning("stop_failure_notify_error %s: %s", sig.symbol, e)
+
+        try:
+            if self.executor:
+                await self.executor.close_position_market(sig.symbol, sig.side, fill.qty, price_hint=fill.price)
+        except Exception as e:
+            log.warning("close_after_stop_fail_error %s: %s", sig.symbol, e)
+
+        if self.exec_mode != "paper":
+            await self._handle_position_closed(sig.symbol)
+
+    async def _on_fill(self, sig: Signal, fill: ExecFill, filters: SymbolFilters) -> None:
+        rt = self.symbols_rt[fill.symbol]
+        scfg = rt.cfg
+        rt.in_position = True
+        rt.position_side = fill.side
+        rt.position_qty = fill.qty
+        rt.pending_signal = None
+        self._positions_total += 1
+
+        stop_info: Dict[str, Any] = {
+            "enabled": scfg.stop_engine_params.enabled,
+            "ready": rt.stop_ready,
+            "be_trigger_r": scfg.stop_engine_params.be_trigger_r,
+            "be_buffer_bps": scfg.stop_engine_params.be_buffer_bps,
+            "atr_len": scfg.stop_engine_params.atr_len,
+            "buffer_bps": scfg.stop_engine_params.buffer_bps,
+            "k_init": scfg.stop_engine_params.k_init,
+            "tp_r_mult": scfg.stop_engine_params.tp_r_mult,
+            "trailing_enabled": scfg.stop_engine_params.trailing.enabled,
+            "trail_trigger_r": scfg.stop_engine_params.trailing.trigger_r,
+            "k_trail": scfg.stop_engine_params.trailing.k_trail,
+            "lock_r": scfg.stop_engine_params.trailing.lock_r,
+        }
+        sl = tp = None
+        R = None
+        tick = filters.tick_size if filters else 0.0
+        if scfg.stop_engine_params.enabled and (not rt.stop_ready or not rt.h1_bars or rt.h1_atr_value is None):
+            await self._handle_stop_failure(sig, fill, scfg, stop_info, "stop_engine_not_ready")
+            return
+        # Initial stop via structure + ATR
+        if scfg.stop_engine_params.enabled and rt.stop_ready and rt.h1_bars and rt.h1_atr_value:
+            try:
+                recent = list(rt.h1_bars)[-scfg.stop_engine_params.htf_lookback_bars:]
+                struct_low = min(b.low for b in recent)
+                struct_high = max(b.high for b in recent)
+                sl0, _ = compute_initial_sl(fill.price, sig.side, struct_low, struct_high, rt.h1_atr_value, scfg.stop_engine_params)
+                sl0_q = quantize_sl(sl0, sig.side, tick)
+                R = abs(fill.price - sl0_q)
+                stop_res = await self.executor.place_or_replace_stop(sig.symbol, sig.side, fill.qty, sl0_q, reason="INIT", tick_size=tick)
+                if stop_res and stop_res.ok:
+                    sl = sl0_q
+                    if stop_res.order_ids:
+                        rt.stop_order_id = stop_res.order_ids.get("stop", rt.stop_order_id)
+                    rt.stop_state = StopState(
+                        side=sig.side,
+                        entry=fill.price,
+                        sl=sl0_q,
+                        R=R,
+                        peak=fill.price,
+                        trough=fill.price,
+                        be_done=False,
+                        trailing_active=False,
+                    )
+                    stop_info.update({"sl": sl0_q, "sl0": sl0_q, "R": R, "atr": rt.h1_atr_value})
+                    rt.last_stop_replace_ms = int(time.time() * 1000)
+                else:
+                    msg = stop_res.msg if stop_res else "stop_failed"
+                    await self._handle_stop_failure(sig, fill, scfg, stop_info, msg)
+                    return
+            except Exception as e:
+                log.warning("Stop-engine placement failed for %s: %s", sig.symbol, e)
+                await self._handle_stop_failure(sig, fill, scfg, stop_info, str(e))
+                return
+
+        if sl is not None and R is not None:
+            tp_target = compute_tp_from_R(fill.price, sig.side, R, scfg.stop_engine_params.tp_r_mult)
+            tp_px = quantize_tp(tp_target, sig.side, tick)
+            try:
+                tp_res = await self.executor.place_or_replace_tp(sig.symbol, sig.side, fill.qty, tp_px, tick)
+                if tp_res and tp_res.ok:
+                    tp = tp_px
+                    if tp_res.order_ids:
+                        rt.tp_order_id = tp_res.order_ids.get("tp", rt.tp_order_id)
+            except Exception as e:
+                log.warning("TP placement failed for %s: %s", sig.symbol, e)
+            stop_info.update({"tp": tp or tp_target})
+
+        self.store.log_trade({
+            "ts_ms": fill.ts_ms,
+            "symbol": sig.symbol,
+            "side": sig.side,
+            "order_id": None,
+            "status": "FILLED",
+            "qty": fill.qty,
+            "entry_price": fill.price,
+            "sl": sl,
+            "tp": tp,
+            "mode": self.exec_mode,
+        })
+
+        stop_info.setdefault("atr", rt.h1_atr_value)
+
+        await self.notifier.send(
+            formatters.format_execution(
+                branding=self.branding,
+                sig=sig,
+                order={},
+                qty=fill.qty,
+                leverage=scfg.orders_cfg.get("leverage", 1),
+                notional=scfg.orders_cfg.get("notional_usdt", 25.0),
+                stop_info=stop_info,
+                exec_mode=self.exec_mode,
+                fill=fill,
+            )
+        )
+
+    def _on_paper_fill(self, fill: ExecFill) -> None:
+        rt = self.symbols_rt.get(fill.symbol)
+        if not rt or rt.pending_signal is None or rt.filters is None:
+            return
+        # Schedule async handling
+        asyncio.create_task(self._on_fill(rt.pending_signal, fill, rt.filters))
+
+    def _on_paper_exit(self, symbol: str, reason: str, exit_px: float, pnl: float, ts_ms: int) -> None:
+        async def _notify():
+            rt = self.symbols_rt[symbol]
+            rt.in_position = False
+            rt.position_side = None
+            rt.position_qty = None
+            rt.stop_state = None
+            rt.stop_order_id = None
+            rt.tp_order_id = None
+            if self._positions_total > 0:
+                self._positions_total -= 1
+            try:
+                await self.notifier.send(f"EXIT detected for {symbol} (paper) reason={reason} pnl={pnl:.6f} px={exit_px:.8f}")
+            except Exception:
+                log.warning("Failed to send paper exit for %s", symbol)
+        asyncio.create_task(_notify())
 
     async def _on_bar_close(self, symbol: str, bar: Bar, heal_gaps: bool = True, emit_alerts: bool = True) -> None:
         rt = self.symbols_rt[symbol]
         if heal_gaps:
             await self._heal_if_gap(symbol, rt, bar, emit_alerts)
         rt.last_bar_open_ms = bar.open_time_ms
+        if self.executor:
+            await self.executor.on_bar_close(symbol, bar.close, bar.close_time_ms)
         scfg = rt.cfg
-        # update ATR
-        atr = rt.atr.update(bar.high, bar.low, bar.close)
+        if scfg.stop_engine_params.enabled and rt.stop_state:
+            update_extremes(rt.stop_state, high=bar.high, low=bar.low)
+
+        # trailing update on bar close
+        await self._maybe_update_stop(symbol, reason="BAR_CLOSE")
 
         sig = rt.strat.on_bar_close(bar)
         if not sig:
@@ -460,6 +863,24 @@ class BotEngine:
             "confirm_time_ms": sig.confirm_time_ms,
         })
 
+        stop_preview = {
+            "enabled": scfg.stop_engine_params.enabled,
+            "ready": rt.stop_ready,
+            "htf_interval": scfg.stop_engine_params.htf_interval,
+            "htf_lookback_bars": scfg.stop_engine_params.htf_lookback_bars,
+            "atr_len": scfg.stop_engine_params.atr_len,
+            "atr": rt.h1_atr_value,
+            "buffer_bps": scfg.stop_engine_params.buffer_bps,
+            "k_init": scfg.stop_engine_params.k_init,
+            "tp_r_mult": scfg.stop_engine_params.tp_r_mult,
+            "trailing_enabled": scfg.stop_engine_params.trailing.enabled,
+            "trail_trigger_r": scfg.stop_engine_params.trailing.trigger_r,
+            "k_trail": scfg.stop_engine_params.trailing.k_trail,
+            "lock_r": scfg.stop_engine_params.trailing.lock_r,
+            "be_trigger_r": scfg.stop_engine_params.be_trigger_r,
+            "be_buffer_bps": scfg.stop_engine_params.be_buffer_bps,
+        }
+
         orders_cfg = scfg.orders_cfg
         notional = float(orders_cfg.get("notional_usdt", 25.0))
         planned_qty = None
@@ -472,18 +893,39 @@ class BotEngine:
             planned_qty = None
             filters = None
 
+        # Preview SL/TP if stop engine is ready
+        if (
+            scfg.stop_engine_params.enabled
+            and rt.stop_ready
+            and rt.h1_bars
+            and rt.h1_atr_value is not None
+        ):
+            try:
+                recent = list(rt.h1_bars)[-scfg.stop_engine_params.htf_lookback_bars:]
+                struct_low = min(b.low for b in recent)
+                struct_high = max(b.high for b in recent)
+                tick_preview = filters.tick_size if filters else 0.0
+                sl0_raw, _ = compute_initial_sl(sig.entry_price, sig.side, struct_low, struct_high, rt.h1_atr_value, scfg.stop_engine_params)
+                sl0_q = quantize_sl(sl0_raw, sig.side, tick_preview)
+                R_q = abs(sig.entry_price - sl0_q)
+                tp0 = compute_tp_from_R(sig.entry_price, sig.side, R_q, scfg.stop_engine_params.tp_r_mult)
+                tp0_q = quantize_tp(tp0, sig.side, tick_preview)
+                stop_preview.update({"sl0": sl0_q, "tp0": tp0_q, "R": R_q})
+            except Exception as e:
+                log.warning("stop_preview_failed %s: %s", sig.symbol, e)
+
         # Telegram alert ALWAYS (pre-trade)
         await self.notifier.send(
             formatters.format_entry(
                 branding=self.branding,
                 sig=sig,
-                atr=atr,
                 strat_params=scfg.strategy_params,
-                atr_params=scfg.atr_params,
+                stop_info=stop_preview,
                 divergence_mode=scfg.divergence_mode,
                 timeframe=self.timeframe,
                 testnet=self.testnet,
                 mode=self.mode,
+                exec_mode=self.exec_mode,
                 cooldown_minutes=self.cooldown_minutes,
                 max_positions_total=self.max_positions_total,
                 one_pos_per_symbol=scfg.position_cfg.get("one_position_per_symbol", True),
@@ -497,21 +939,25 @@ class BotEngine:
             return
         if self._positions_total >= self.max_positions_total:
             return
+        if scfg.stop_engine_params.enabled and not rt.stop_ready:
+            self._log_signal_suppressed(sig, "stop_engine_not_ready")
+            return
 
         if self.mode != "live" or not self._live_enabled:
             return
 
-        assert self.rest is not None
-        # Leverage (futures)
-        lev = int(orders_cfg.get("leverage", 1))
-        await self.rest.set_leverage(sig.symbol, lev)
-
-        # Determine quantity from notional
-        if filters is None:
+        if filters is None and self.rest:
             filters = await self.rest.get_symbol_filters(sig.symbol)
+        if filters:
+            rt.filters = filters
+        if filters is None:
+            return
+
         qty_raw = notional / sig.entry_price
         qty = quantize(qty_raw, filters.step_size)
-        levels = atr_levels(sig.side, sig.entry_price, atr, scfg.atr_params)
+        lev = int(orders_cfg.get("leverage", 1))
+        if self.exec_mode == "binance" and self.rest:
+            await self.rest.set_leverage(sig.symbol, lev)
         if qty < filters.min_qty:
             err = RuntimeError(f"Qty too small for {sig.symbol}: {qty} < min {filters.min_qty}")
             await self.notifier.send(
@@ -519,77 +965,93 @@ class BotEngine:
                     branding=self.branding,
                     sig=sig,
                     order={"orderId": "n/a", "status": "REJECTED"},
-                    levels=levels,
                     qty=qty,
                     leverage=lev,
                     notional=notional,
-                    atr_params=scfg.atr_params,
-                    atr_value=atr,
+                    exec_mode=self.exec_mode,
+                    stop_info=stop_preview,
                     error=err,
                 )
             )
             return
 
-        # Place market entry
-        side = "BUY" if sig.side == "LONG" else "SELL"
-        order = {}
-        sl = tp = None
-        try:
-            order = await self.rest.order_market(sig.symbol, side=side, qty=qty, reduce_only=False)
-
-            # Risk orders (optional)
-            if scfg.atr_params.enabled and levels.sl and levels.tp:
-                # For futures, exit sides are opposite
-                exit_side = "SELL" if sig.side == "LONG" else "BUY"
-                # Quantize prices to tick
-                sl = round(levels.sl / filters.tick_size) * filters.tick_size
-                tp = round(levels.tp / filters.tick_size) * filters.tick_size
-                await self.rest.order_stop_market(sig.symbol, side=exit_side, qty=qty, stop_price=sl, reduce_only=True)
-                await self.rest.order_take_profit_market(sig.symbol, side=exit_side, qty=qty, stop_price=tp, reduce_only=True)
-
-            rt.in_position = True
-            self._positions_total += 1
-        except Exception as e:
-            log.warning("Execution failed for %s: %s", sig.symbol, e)
+        if self.executor is None:
+            return
+        rt.pending_signal = sig
+        res = await self.executor.place_entry(sig.symbol, sig.side, qty, ref="signal")
+        if not res.ok:
             await self.notifier.send(
                 formatters.format_execution(
                     branding=self.branding,
                     sig=sig,
-                    order=order or {"orderId": "n/a", "status": "ERROR"},
-                    levels=levels,
+                    order={"orderId": "n/a", "status": res.msg},
                     qty=qty,
                     leverage=lev,
                     notional=notional,
-                    atr_params=scfg.atr_params,
-                    atr_value=atr,
-                    error=e,
+                    exec_mode=self.exec_mode,
+                    stop_info=stop_preview,
+                    error=RuntimeError(res.msg),
                 )
             )
             return
+        fill_obj = res.fill
+        if fill_obj is None and self.exec_mode == "binance":
+            fill_obj = ExecFill(symbol=sig.symbol, side=sig.side, qty=qty, price=sig.entry_price, fee_paid=0.0, ts_ms=now_ms, mode="binance")
+        if fill_obj:
+            await self._on_fill(sig, fill_obj, filters)
 
-        self.store.log_trade({
-            "ts_ms": now_ms,
-            "symbol": sig.symbol,
-            "side": sig.side,
-            "order_id": order.get("orderId") if isinstance(order, dict) else None,
-            "status": order.get("status") if isinstance(order, dict) else None,
-            "qty": qty,
-            "entry_price": sig.entry_price,
-            "sl": sl,
-            "tp": tp,
-            "mode": self.mode,
-        })
+    async def _handle_position_closed(self, symbol: str) -> None:
+        rt = self.symbols_rt[symbol]
+        if not rt.in_position:
+            return
+        rt.in_position = False
+        rt.position_side = None
+        rt.position_qty = None
+        rt.stop_state = None
+        if self._positions_total > 0:
+            self._positions_total -= 1
+        if self.rest:
+            for oid in (rt.stop_order_id, rt.tp_order_id):
+                if not oid:
+                    continue
+                try:
+                    await self.rest.cancel_order(symbol, oid)
+                except Exception as e:
+                    log.warning("Cancel failed for %s order %s: %s", symbol, oid, e)
+        rt.stop_order_id = None
+        rt.tp_order_id = None
+        try:
+            await self.notifier.send(f"EXIT detected for {symbol} ({self.exec_mode})")
+        except Exception:
+            log.warning("Failed to send exit notice for %s", symbol)
 
-        await self.notifier.send(
-            formatters.format_execution(
-                branding=self.branding,
-                sig=sig,
-                order=order,
-                levels=levels,
-                qty=qty,
-                leverage=lev,
-                notional=notional,
-                atr_params=scfg.atr_params,
-                atr_value=atr,
-            )
-        )
+    async def _position_watchdog_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(5)
+                if self.rest is None:
+                    continue
+                positions = []
+                try:
+                    positions = await self.rest.get_position_risk()
+                except Exception as e:
+                    log.warning("Position check batch failed: %s", e)
+                    continue
+                pos_map: Dict[str, float] = {}
+                if isinstance(positions, list):
+                    for row in positions:
+                        sym = row.get("symbol")
+                        try:
+                            pos_map[sym] = float(row.get("positionAmt", 0))
+                        except Exception:
+                            pos_map[sym] = 0.0
+                for sym, rt in self.symbols_rt.items():
+                    if not rt.in_position:
+                        continue
+                    amt = pos_map.get(sym, 0.0)
+                    if abs(amt) <= 1e-9:
+                        await self._handle_position_closed(sym)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning("Position watchdog error: %s", e)

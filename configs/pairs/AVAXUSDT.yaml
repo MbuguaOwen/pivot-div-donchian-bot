@@ -8,11 +8,23 @@ strategy:
   oscillator:
     ema_length: 14
 risk:
-  atr:
-    enabled: false
-    length: 14
-    sl_mult: 2.0
-    tp_mult: 3.0
+  engine:
+    enabled: true
+    htf_interval: "1h"
+    htf_lookback_bars: 72
+    buffer_bps: 10
+    atr_len: 24
+    k_init: 1.8
+    tp_r_mult: 2.0
+    be_trigger_r: 1.0
+    be_buffer_bps: 10
+    trailing:
+      enabled: false
+      trigger_r: 2.5
+      k_trail: 1.6
+      lock_r: 1.0
+    min_stop_replace_interval_sec: 2
+    min_stop_tick_improvement: 2
 orders:
   notional_usdt: 25.0
   leverage: 3
