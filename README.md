@@ -79,6 +79,47 @@ When enabled, the bot places (Futures) protective orders:
 - `STOP_MARKET` for SL
 - `TAKE_PROFIT_MARKET` for TP
 
+## Execution modes (paper vs binance)
+- Config block:
+  ```yaml
+  execution:
+    mode: paper   # paper | binance
+    paper:
+      fee_bps: 4.0           # per-side fees
+      slippage_bps: 1.5      # applied on fills/exits against you
+      fill_policy: next_tick # next_tick | bar_close_fallback
+      max_wait_ms: 3000      # fallback deadline for bar_close_fallback
+      use_mark_price: false
+      log_trades: true
+  ```
+- `paper`: uses live mainnet websockets, no signed REST, local fills (next aggTrade tick) with slippage/fees, internal SL/TP + stop-engine exits. No API keys required.
+- `binance`: current live behavior (signed REST orders, positionRisk watchdog, stop cancel/replace throttled).
+- Telegram execution messages show the EXEC mode and fill px/fees; exits in paper mode are announced as `(paper)`.
+
+## Structure + ATR trailing stop engine
+- Enable via `risk.stop_engine.enabled` (default false). The bot will subscribe to 1h klines + aggTrade for all symbols to drive the stop engine.
+- SL0: last 24 CLOSED 1h bars with 10 bps buffer, capped at `k_init * ATR(1h,24)`.
+- BE: +1.5R -> entry + 10 bps buffer. Trail: +2R activates and locks +1.3R instantly.
+- Trailing offset uses `max(k_trail * ATR(1h,24), 0.7R)`; stop is monotonic (never loosens).
+- Config block:
+  ```yaml
+  risk:
+    stop_engine:
+      enabled: false
+      htf_interval: "1h"
+      htf_lookback_bars: 24
+      atr_len: 24
+      k_init: 1.6
+      k_trail: 1.6
+      buffer_bps: 10
+      be_trigger_r: 1.5
+      be_buffer_bps: 10
+      trail_trigger_r: 2.0
+      lock_r: 1.3
+      min_stop_replace_interval_sec: 2   # throttle cancel/replace spam
+      min_stop_tick_improvement: 2       # require >= this many ticks improvement
+  ```
+
 ## Configuring many pairs
 You can:
 1) Provide an explicit list of symbols, OR

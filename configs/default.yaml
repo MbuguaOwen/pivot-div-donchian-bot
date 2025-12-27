@@ -1,12 +1,21 @@
 run:
   mode: live         # paper | live
-  timeframe: "15m"
-  heartbeat_seconds: 30
+  timeframe: "1h"
 
 exchange:
   market_type: futures # futures | spot
   testnet: false
   recv_window_ms: 5000
+
+execution:
+  mode: paper   # paper | binance
+  paper:
+    fee_bps: 4.0
+    slippage_bps: 1.5
+    fill_policy: next_tick   # next_tick | bar_close_fallback
+    max_wait_ms: 3000
+    use_mark_price: false
+    log_trades: true
 
 universe:
   dynamic: false
@@ -67,6 +76,20 @@ risk:
     length: 14
     sl_mult: 2.0
     tp_mult: 3.0
+  stop_engine:
+    enabled: true
+    htf_interval: "1h"
+    htf_lookback_bars: 24
+    atr_len: 24
+    k_init: 25.0
+    k_trail: 10.0
+    buffer_bps: 10
+    be_trigger_r: 1.5
+    be_buffer_bps: 10
+    trail_trigger_r: 2.0
+    lock_r: 0.5
+    min_stop_replace_interval_sec: 2
+    min_stop_tick_improvement: 2
 
 orders:
   # Position sizing: simplest is fixed notional in USDT (converted to quantity).

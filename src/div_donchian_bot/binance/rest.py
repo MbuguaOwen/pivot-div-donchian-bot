@@ -197,6 +197,44 @@ class BinanceRest:
         }
         return await self._request("POST", "/fapi/v1/order", params, signed=True)
 
+    async def cancel_order(self, symbol: str, order_id: str) -> Any:
+        params = {"symbol": symbol, "orderId": order_id}
+        if self.market_type == "futures":
+            return await self._request("DELETE", "/fapi/v1/order", params, signed=True)
+        return await self._request("DELETE", "/api/v3/order", params, signed=True)
+
+    async def get_open_orders(self, symbol: Optional[str] = None) -> Any:
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        if self.market_type == "futures":
+            return await self._request("GET", "/fapi/v1/openOrders", params, signed=True)
+        return await self._request("GET", "/api/v3/openOrders", params, signed=True)
+
+    async def get_position_risk(self, symbol: Optional[str] = None) -> Any:
+        if self.market_type != "futures":
+            return []
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        return await self._request("GET", "/fapi/v2/positionRisk", params, signed=True)
+
+    async def get_position_amt(self, symbol: str) -> float:
+        data = await self.get_position_risk(symbol)
+        if isinstance(data, list):
+            for row in data:
+                if row.get("symbol") == symbol:
+                    try:
+                        return float(row.get("positionAmt", 0))
+                    except Exception:
+                        return 0.0
+        if isinstance(data, dict) and data.get("symbol") == symbol:
+            try:
+                return float(data.get("positionAmt", 0))
+            except Exception:
+                return 0.0
+        return 0.0
+
     async def fetch_last_n_bars(self, symbol: str, interval: str, limit: int) -> List[Bar]:
         """Fetch the latest closed klines for warmup/backfill."""
         limit = max(1, min(int(limit), 1000))

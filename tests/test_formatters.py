@@ -32,6 +32,7 @@ def test_telegram_html_formatting():
         timeframe="15m",
         testnet=True,
         mode="paper",
+        exec_mode="paper",
         cooldown_minutes=30,
         max_positions_total=20,
         one_pos_per_symbol=True,

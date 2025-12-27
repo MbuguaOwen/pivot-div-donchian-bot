@@ -7,23 +7,30 @@ from typing import Any, Dict, List, Optional
 from ..models import Signal
 from ..risk.atr_risk import AtrRiskParams, RiskLevels, atr_levels
 from ..strategy.pivot_div_donchian import StrategyParams
+from ..execution.base import ExecFill
 
 MAX_TELEGRAM_CHARS = 4096
+ICON = "\U0001F3DB"  # 🏛
+
 
 def escape(val: Any) -> str:
     return html.escape(str(val)) if val is not None else ""
+
 
 def _ts_utc(ts_ms: Optional[int]) -> str:
     if not ts_ms:
         return "n/a"
     return dt.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%SZ")
 
+
 def _footer(branding: str) -> str:
     now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
     return f"<pre>Time: {now} | Bot: {escape(branding)}</pre>"
 
+
 def _pre(lines: List[str]) -> str:
     return "<pre>\n" + "\n".join(lines) + "\n</pre>"
+
 
 def _truncate(text: str) -> str:
     if len(text) <= MAX_TELEGRAM_CHARS:
@@ -31,11 +38,13 @@ def _truncate(text: str) -> str:
     suffix = "... [truncated]"
     return text[: MAX_TELEGRAM_CHARS - len(suffix)] + suffix
 
+
 # --- Formatters ---
 
 def format_startup(
     branding: str,
     mode: str,
+    exec_mode: str,
     testnet: bool,
     exchange: str,
     market_type: str,
@@ -53,9 +62,9 @@ def format_startup(
     cvd_count = len(cvd_symbols)
     cvd_preview = ", ".join(cvd_symbols[:5]) + (" ..." if cvd_count > 5 else "")
     net = "Testnet" if testnet else "Mainnet"
-    header = f"<b>🏛 {escape(branding)}</b>"
+    header = f"<b>{ICON} {escape(branding)}</b>"
     block = _pre([
-        f"MODE: {mode.upper():<6} | TF: {escape(timeframe):<5} | MKT: {market_type} | NET: {net} | DIR: {direction}",
+        f"MODE: {mode.upper():<6} | EXEC: {exec_mode} | TF: {escape(timeframe):<5} | MKT: {market_type} | NET: {net} | DIR: {direction}",
         f"SYMS: {sym_count:<4} ({escape(sym_preview)}) | CVD: {cvd_count:<4} ({escape(cvd_preview)})",
         f"ATR: {atr_enabled} | Limits: max_pos={max_positions_total}, cooldown={cooldown_minutes}m | Heartbeat: {heartbeat_sec}s",
     ])
@@ -72,7 +81,7 @@ def format_heartbeat(
     last_signal_ts_ms: Optional[int],
     uptime_seconds: int,
 ) -> str:
-    header = f"<b>⏱ HEARTBEAT — {escape(branding)}</b>"
+    header = f"<b>{ICON} HEARTBEAT {escape(branding)}</b>"
     last_sig = _ts_utc(last_signal_ts_ms)
     block = _pre([
         f"MODE: {mode.upper():<6} | NET: {'Testnet' if testnet else 'Mainnet'} | SYMS: {symbols_count}",
@@ -91,15 +100,16 @@ def format_entry(
     timeframe: str,
     testnet: bool,
     mode: str,
+    exec_mode: str,
     cooldown_minutes: int,
     max_positions_total: int,
     one_pos_per_symbol: bool,
     notional_usdt: Any,
     planned_qty: Optional[float] = None,
 ) -> str:
-    header = "<b>📌 TRADE SIGNAL — ENTRY</b>"
+    header = f"<b>{ICON} TRADE SIGNAL - ENTRY</b>"
     net_label = "Testnet" if testnet else "Mainnet"
-    mode_line = f"MODE: {mode.upper():<6} | TF: {escape(timeframe):<5} | NET: {net_label}"
+    mode_line = f"MODE: {mode.upper():<6} | EXEC: {exec_mode} | TF: {escape(timeframe):<5} | NET: {net_label}"
     ctx = _pre([
         f"SYM: {escape(sig.symbol):<12} | SIDE: {escape(sig.side):<5} | TIME: {_ts_utc(sig.confirm_time_ms)}",
         f"{mode_line}",
@@ -146,13 +156,19 @@ def format_execution(
     notional: Any,
     atr_params: AtrRiskParams,
     atr_value: float,
+    exec_mode: str,
+    fill: Optional[ExecFill] = None,
     error: Optional[Exception] = None,
+    stop_info: Optional[Dict[str, Any]] = None,
 ) -> str:
-    header = "<b>🤝 EXECUTION RESULT</b>"
-    sig_block = _pre([
+    header = f"<b>{ICON} EXECUTION RESULT</b>"
+    sig_block_lines = [
         f"SYM: {escape(sig.symbol):<12} | SIDE: {escape(sig.side):<5} | QTY: {qty}",
-        f"Notional: ${notional} | Lev: {leverage}",
-    ])
+        f"EXEC: {exec_mode} | Notional: ${notional} | Lev: {leverage}",
+    ]
+    if fill is not None:
+        sig_block_lines.append(f"FillPx: {fill.price:.8f} | Fee: {fill.fee_paid:.8f}")
+    sig_block = _pre(sig_block_lines)
     ord_block = _pre([
         f"OrderId: {order.get('orderId', 'n/a')} | Status: {order.get('status', 'n/a')}",
         f"AvgFill: {order.get('avgPrice', order.get('price', 'n/a'))}",
@@ -162,17 +178,27 @@ def format_execution(
     else:
         risk_line = f"SL/TP: DISABLED | ATR{atr_params.length}: {atr_value:.8f}"
     risk_block = _pre([risk_line])
+    stop_block: List[str] = []
+    if stop_info is not None:
+        stop_block = [
+            "<b>Stop</b>",
+            _pre([
+                f"Engine: {stop_info.get('enabled', False)} ready={stop_info.get('ready', False)}",
+                f"SL0: {stop_info.get('sl0', 'n/a')} | R: {stop_info.get('R', 'n/a')} | ATR1H24: {stop_info.get('atr', 'n/a')}",
+            ]),
+        ]
     err_block: List[str] = []
     if error is not None:
         err_block = ["<b>Error</b>", _pre([f"{escape(error)}"])]
     parts = [header, sig_block, "<b>Order</b>", ord_block, "<b>Risk</b>", risk_block]
+    parts.extend(stop_block)
     parts.extend(err_block)
     parts.append(_footer(branding))
     return _truncate("\n".join(parts))
 
 
 def format_error(branding: str, context: str, exc: Exception) -> str:
-    header = "<b>⚠️ ERROR</b>"
+    header = "<b>ERROR</b>"
     ctx = _pre([
         f"Context: {escape(context)}",
         f"Error:   {escape(exc)}",
