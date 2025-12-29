@@ -143,6 +143,15 @@ tv_bridge:
   alert_on_mismatch: true
   require_tf_match: false
 
+healthcheck:
+  enabled: true
+  # Default hits the local tv_bridge /health endpoint over loopback
+  url: "http://127.0.0.1:9001/health"
+  interval_seconds: 60
+  timeout_seconds: 5
+  alert_on_failure: true
+  alert_on_recovery: true
+
 storage:
   out_dir: "artifacts"
 

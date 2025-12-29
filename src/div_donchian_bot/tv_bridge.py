@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -120,12 +121,24 @@ class TvWebhookServer:
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
+        self._started_ms = int(time.time() * 1000)
+        self._last_webhook_ms = 0
 
     async def start(self) -> None:
         if not self.cfg.enabled:
             return
         self._app = web.Application()
-        self._app.add_routes([web.post(self.cfg.path, self._handle)])
+        routes = [web.post(self.cfg.path, self._handle)]
+
+        # health endpoints (always on /health, /, and under the webhook base)
+        health_paths = {"/health", "/"}
+        base = (self.cfg.path or "").rstrip("/")
+        if base and base != "/":
+            health_paths.add(f"{base}/health")
+        for hp in sorted(health_paths):
+            routes.append(web.get(hp, self._health))
+
+        self._app.add_routes(routes)
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, host=self.cfg.host, port=self.cfg.port)
@@ -147,6 +160,8 @@ class TvWebhookServer:
         except Exception:
             txt = (await request.text()) if request.can_read_body else ""
             return web.json_response({"ok": False, "error": "invalid_json", "body": txt[:200]}, status=400)
+
+        self._last_webhook_ms = int(time.time() * 1000)
 
         # Secret (optional but strongly recommended)
         if self.cfg.secret:
@@ -209,3 +224,16 @@ class TvWebhookServer:
             log.warning("tv_bridge_task_create_failed %s", e)
 
         return web.json_response({"ok": True, "symbol": symbol, "side": side, "confirm_time_ms": confirm_time_ms})
+
+    async def _health(self, request: web.Request) -> web.Response:
+        now_ms = int(time.time() * 1000)
+        uptime_s = max(0, (now_ms - self._started_ms) // 1000)
+        return web.json_response({
+            "ok": True,
+            "mode": getattr(self.cfg, "mode", None),
+            "path": getattr(self.cfg, "path", None),
+            "port": getattr(self.cfg, "port", None),
+            "pid": os.getpid(),
+            "uptime_s": uptime_s,
+            "last_webhook_ms": self._last_webhook_ms,
+        })

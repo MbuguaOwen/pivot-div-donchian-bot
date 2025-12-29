@@ -139,11 +139,31 @@ class BotEngine:
             desync_pause=bool(parity_cfg.get("desync_pause", True)),
         )
 
+        health_cfg = cfg.get("healthcheck", {}) or {}
+        tv_cfg_raw = cfg.get("tv_bridge", {}) or {}
+        host_for_health = tv_cfg_raw.get("host", "127.0.0.1")
+        if host_for_health in ("0.0.0.0", "::"):
+            host_for_health = "127.0.0.1"
+        default_health_url = f"http://{host_for_health}:{tv_cfg_raw.get('port', 9001)}/health" if tv_cfg_raw.get("enabled", False) else ""
+        self.health_enabled = bool(health_cfg.get("enabled", False))
+        self.health_url = str(health_cfg.get("url", default_health_url or "") or default_health_url or "")
+        self.health_interval_sec = int(health_cfg.get("interval_seconds", 60))
+        self.health_timeout_sec = float(health_cfg.get("timeout_seconds", 5.0))
+        self.health_alert_on_failure = bool(health_cfg.get("alert_on_failure", True))
+        self.health_alert_on_recovery = bool(health_cfg.get("alert_on_recovery", True))
+        self._last_healthcheck_ms = 0
+        self._health_failed = False
+
         # TradingView bridge (optional). When enabled, TradingView can become
         # the signal engine (tv_only) or enforce a two-man rule (tv_and_bot).
         self.tv_cfg = TvBridgeConfig.from_dict(cfg.get("tv_bridge", {}) or {})
         if self.tv_cfg.mode not in ("tv_only", "tv_and_bot"):
             self.tv_cfg.mode = "tv_only"
+        if not self.health_url and self.tv_cfg.enabled:
+            host = self.tv_cfg.host
+            if host in ("0.0.0.0", "::"):
+                host = "127.0.0.1"
+            self.health_url = f"http://{host}:{self.tv_cfg.port}/health"
         self.tv_server: Optional[TvWebhookServer] = None
         self._pending_tv: Dict[tuple[str, str, int, str], TvSignal] = {}
         self._pending_bot: Dict[tuple[str, str, int, str], Signal] = {}
@@ -168,6 +188,7 @@ class BotEngine:
         self._live_enabled = True
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._position_watchdog_task: Optional[asyncio.Task] = None
+        self._healthcheck_task: Optional[asyncio.Task] = None
         self._sent_alert_keys: set[tuple[str, str, int, str]] = set()
 
     async def start(self, rest: BinanceRest, ws_url: str, symbols: List[str]) -> None:
@@ -307,6 +328,8 @@ class BotEngine:
         # Heartbeat
         if self.heartbeat_enabled:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if self.health_enabled and self.health_url:
+            self._healthcheck_task = asyncio.create_task(self._healthcheck_loop())
         if self.exec_mode == "binance" and self.mode == "live":
             self._position_watchdog_task = asyncio.create_task(self._position_watchdog_loop())
 
@@ -456,6 +479,9 @@ class BotEngine:
         if self._position_watchdog_task:
             self._position_watchdog_task.cancel()
             self._position_watchdog_task = None
+        if self._healthcheck_task:
+            self._healthcheck_task.cancel()
+            self._healthcheck_task = None
         if self.controls:
             await self.controls.stop()
         await self.notifier.stop()
@@ -482,11 +508,53 @@ class BotEngine:
                 )
             )
 
+    async def _healthcheck_loop(self) -> None:
+        while True:
+            await asyncio.sleep(max(self.health_interval_sec, 1))
+            try:
+                await self._maybe_healthcheck(int(time.time() * 1000))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning("healthcheck_error %s", e)
+
     def _signal_key(self, sig: Signal) -> tuple[str, str, int, str]:
         return (sig.symbol, self.timeframe, sig.confirm_time_ms, sig.side)
 
     def _tv_key(self, symbol: str, side: Side, confirm_time_ms: int) -> tuple[str, str, int, str]:
         return (symbol, self.timeframe, confirm_time_ms, side)
+
+    async def _maybe_healthcheck(self, now_ms: int) -> None:
+        if not self.health_enabled or not self.health_url:
+            return
+        if (now_ms - self._last_healthcheck_ms) < max(self.health_interval_sec, 1) * 1000:
+            return
+        self._last_healthcheck_ms = now_ms
+
+        ok = False
+        err_text = ""
+        try:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=self.health_timeout_sec)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.health_url) as resp:
+                    if resp.status == 200:
+                        ok = True
+                    else:
+                        err_text = f"HTTP {resp.status}"
+        except Exception as e:
+            err_text = str(e)
+
+        if ok:
+            if self._health_failed and self.health_alert_on_recovery:
+                await self.notifier.send(f"✅ Webhook healthcheck recovered: {self.health_url}")
+            self._health_failed = False
+            return
+
+        if not self._health_failed and self.health_alert_on_failure:
+            await self.notifier.send(f"⚠️ Webhook healthcheck FAILED: {self.health_url} err={err_text or 'unknown'}")
+        self._health_failed = True
 
     def _log_parity(self, key: tuple[str, str, int, str], tv: bool, bot: bool, action: str, details: str = "") -> None:
         now_ms = int(time.time() * 1000)
