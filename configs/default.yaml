@@ -129,6 +129,20 @@ telegram:
   controls_allowed_chat_id: null
   controls_state_path: "state/telegram_controls.json"
 
+tv_bridge:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9001
+  path: "/tv"
+  # Provide TV webhook secret via env (recommended)
+  secret_env: "TV_WEBHOOK_SECRET"
+  # modes: tv_only | tv_and_bot
+  mode: "tv_only"
+  # How long to wait for the other side in tv_and_bot / parity checks
+  match_window_ms: 120000
+  alert_on_mismatch: true
+  require_tf_match: false
+
 storage:
   out_dir: "artifacts"
 

@@ -34,6 +34,7 @@ from .config import deep_merge, load_pair_override
 from .alerts import formatters
 from .direction import DirectionGate
 from .telegram_controls import TelegramControls, control_keyboard
+from .tv_bridge import TvBridgeConfig, TvWebhookServer, TvSignal
 
 log = logging.getLogger("engine")
 
@@ -100,6 +101,7 @@ class SymbolRuntime:
     in_position: bool = False
     last_signal_ts_ms: int = 0
     last_bar_open_ms: Optional[int] = None
+    last_price: Optional[float] = None
     desynced: bool = False
     desync_warned: bool = False
 
@@ -136,6 +138,15 @@ class BotEngine:
             gap_heal=bool(parity_cfg.get("gap_heal", True)),
             desync_pause=bool(parity_cfg.get("desync_pause", True)),
         )
+
+        # TradingView bridge (optional). When enabled, TradingView can become
+        # the signal engine (tv_only) or enforce a two-man rule (tv_and_bot).
+        self.tv_cfg = TvBridgeConfig.from_dict(cfg.get("tv_bridge", {}) or {})
+        if self.tv_cfg.mode not in ("tv_only", "tv_and_bot"):
+            self.tv_cfg.mode = "tv_only"
+        self.tv_server: Optional[TvWebhookServer] = None
+        self._pending_tv: Dict[tuple[str, str, int, str], TvSignal] = {}
+        self._pending_bot: Dict[tuple[str, str, int, str], Signal] = {}
         self.controls: Optional[TelegramControls] = None
         self.controls_enabled = bool(tg_cfg.get("controls_enabled", False))
         self.controls_allowed_chat_id = tg_cfg.get("controls_allowed_chat_id")
@@ -198,6 +209,19 @@ class BotEngine:
                     parse_mode=self.parse_mode,
                 )
                 await self.controls.start()
+
+        # Optional TradingView webhook server (runs inside the bot)
+        if self.tv_cfg.enabled:
+            self.tv_server = TvWebhookServer(self.tv_cfg, on_signal=self._on_tv_signal)
+            await self.tv_server.start()
+            if not self.tv_cfg.secret:
+                log.warning("tv_bridge_enabled_but_no_secret")
+            try:
+                await self.notifier.send(
+                    f"TV bridge: ON | mode={self.tv_cfg.mode} | listen=http://{self.tv_cfg.host}:{self.tv_cfg.port}{self.tv_cfg.path}"
+                )
+            except Exception:
+                log.exception("Failed to send TV bridge startup notice")
 
         # Build per-symbol runtime/config
         cvd_symbols: List[str] = []
@@ -420,6 +444,12 @@ class BotEngine:
     async def stop(self) -> None:
         if self.ws:
             await self.ws.stop()
+        if self.tv_server:
+            try:
+                await self.tv_server.stop()
+            except Exception:
+                log.exception("tv_bridge_stop_failed")
+            self.tv_server = None
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
@@ -454,6 +484,362 @@ class BotEngine:
 
     def _signal_key(self, sig: Signal) -> tuple[str, str, int, str]:
         return (sig.symbol, self.timeframe, sig.confirm_time_ms, sig.side)
+
+    def _tv_key(self, symbol: str, side: Side, confirm_time_ms: int) -> tuple[str, str, int, str]:
+        return (symbol, self.timeframe, confirm_time_ms, side)
+
+    def _log_parity(self, key: tuple[str, str, int, str], tv: bool, bot: bool, action: str, details: str = "") -> None:
+        now_ms = int(time.time() * 1000)
+        symbol, _tf, confirm_ms, side = key
+        try:
+            self.store.log_parity({
+                "ts_ms": now_ms,
+                "mode": self.tv_cfg.mode,
+                "symbol": symbol,
+                "side": side,
+                "confirm_time_ms": confirm_ms,
+                "tv": int(tv),
+                "bot": int(bot),
+                "action": action,
+                "details": details,
+            })
+        except Exception:
+            log.exception("parity_csv_write_failed")
+
+    async def _parity_timeout_tv(self, key: tuple[str, str, int, str]) -> None:
+        await asyncio.sleep(max(self.tv_cfg.match_window_ms, 1000) / 1000)
+        tv_sig = self._pending_tv.pop(key, None)
+        if not tv_sig:
+            return
+        # Still unmatched
+        log.warning("parity_breach_tv_only key=%s symbol=%s side=%s confirm=%s", key, tv_sig.symbol, tv_sig.side, tv_sig.confirm_time_ms)
+        self._log_parity(key, tv=True, bot=False, action="mismatch", details="tv_only")
+        if self.tv_cfg.alert_on_mismatch:
+            try:
+                await self.notifier.send(
+                    f"⚠️ PARITY BREACH (TV only): {tv_sig.symbol} {tv_sig.side} confirm={tv_sig.confirm_time_ms}"
+                )
+            except Exception:
+                log.warning("Failed to send TV-only parity breach")
+
+    async def _parity_timeout_bot(self, key: tuple[str, str, int, str]) -> None:
+        await asyncio.sleep(max(self.tv_cfg.match_window_ms, 1000) / 1000)
+        bot_sig = self._pending_bot.pop(key, None)
+        if not bot_sig:
+            return
+        log.warning("parity_breach_bot_only key=%s symbol=%s side=%s confirm=%s", key, bot_sig.symbol, bot_sig.side, bot_sig.confirm_time_ms)
+        self._log_parity(key, tv=False, bot=True, action="mismatch", details="bot_only")
+        if self.tv_cfg.alert_on_mismatch:
+            try:
+                await self.notifier.send(
+                    f"⚠️ PARITY BREACH (BOT only): {bot_sig.symbol} {bot_sig.side} confirm={bot_sig.confirm_time_ms}"
+                )
+            except Exception:
+                log.warning("Failed to send BOT-only parity breach")
+
+    def _signal_from_tv(self, tv: TvSignal, rt: SymbolRuntime) -> Signal:
+        # Entry price: prefer TV-provided, else our last known price.
+        entry = tv.entry_price
+        if entry is None:
+            entry = rt.last_price
+        if entry is None:
+            entry = 0.0
+        return Signal(
+            symbol=tv.symbol,
+            side=tv.side,
+            entry_price=float(entry),
+            pivot_price=float(tv.pivot_price) if tv.pivot_price is not None else float(entry),
+            pivot_osc_value=float(tv.pivot_osc) if tv.pivot_osc is not None else 0.0,
+            pivot_cvd_value=None,
+            slip_bps=float(tv.slip_bps) if tv.slip_bps is not None else 0.0,
+            loc_at_pivot=float(tv.loc_at_pivot) if tv.loc_at_pivot is not None else 0.5,
+            oscillator_name="tv",
+            pine_div=True,
+            cvd_div=False,
+            pivot_time_ms=int(tv.confirm_time_ms),
+            confirm_time_ms=int(tv.confirm_time_ms),
+        )
+
+    async def _on_tv_signal(self, tv: TvSignal) -> None:
+        """Handle an incoming TradingView webhook.
+
+        The webhook contains a bar-confirmed signal. Depending on mode:
+        - tv_only: trade on TV signal
+        - tv_and_bot: trade only if bot's strategy produced the same key
+        """
+        if not self.tv_cfg.enabled:
+            return
+        symbol = tv.symbol
+        if symbol not in self.symbols_rt:
+            log.warning("tv_bridge_unknown_symbol %s", symbol)
+            return
+        if self.tv_cfg.require_tf_match and tv.tf:
+            if tv.tf != self.timeframe:
+                log.info("tv_bridge_tf_mismatch symbol=%s tv_tf=%s bot_tf=%s", symbol, tv.tf, self.timeframe)
+
+        now_ms = int(time.time() * 1000)
+        try:
+            self.store.log_tv_signal({
+                "ts_ms": now_ms,
+                "symbol": tv.symbol,
+                "side": tv.side,
+                "confirm_time_ms": tv.confirm_time_ms,
+                "tf": tv.tf or "",
+                "entry_price": tv.entry_price if tv.entry_price is not None else "",
+                "pivot_price": tv.pivot_price if tv.pivot_price is not None else "",
+                "pivot_osc": tv.pivot_osc if tv.pivot_osc is not None else "",
+                "slip_bps": tv.slip_bps if tv.slip_bps is not None else "",
+                "loc_at_pivot": tv.loc_at_pivot if tv.loc_at_pivot is not None else "",
+                "tickerid": tv.tickerid or "",
+            })
+        except Exception:
+            log.exception("tv_signals_csv_write_failed")
+
+        key = self._tv_key(tv.symbol, tv.side, tv.confirm_time_ms)
+        rt = self.symbols_rt[tv.symbol]
+
+        # tv_only: TV is boss
+        if self.tv_cfg.mode == "tv_only":
+            # log compare if bot had same signal
+            if key in self._pending_bot:
+                self._pending_bot.pop(key, None)
+                self._log_parity(key, tv=True, bot=True, action="match", details="tv_only")
+            else:
+                # schedule mismatch check for TV-only event
+                self._pending_tv[key] = tv
+                asyncio.create_task(self._parity_timeout_tv(key))
+
+            sig = self._signal_from_tv(tv, rt)
+            await self._execute_tradable_signal(sig, rt, source="TV")
+            return
+
+        # tv_and_bot: two-man rule
+        if self.tv_cfg.mode == "tv_and_bot":
+            self._pending_tv[key] = tv
+            bot_sig = self._pending_bot.pop(key, None)
+            if bot_sig is None:
+                asyncio.create_task(self._parity_timeout_tv(key))
+                return
+
+            # matched
+            self._pending_tv.pop(key, None)
+            self._log_parity(key, tv=True, bot=True, action="match", details="tv_and_bot")
+            await self._execute_tradable_signal(bot_sig, rt, source="TV+BOT")
+            return
+
+    async def _on_bot_signal_tv_mode(self, sig: Signal, rt: SymbolRuntime) -> None:
+        """Register bot strategy signal for parity/matching under TV modes."""
+        key = self._signal_key(sig)
+        self._pending_bot[key] = sig
+
+        # For parity debugging, still write bot signal to events.csv (as-is)
+        now_ms = int(time.time() * 1000)
+        try:
+            self.store.log_event({
+                "ts_ms": now_ms,
+                "symbol": sig.symbol,
+                "side": sig.side,
+                "entry_price": sig.entry_price,
+                "pivot_price": sig.pivot_price,
+                "pivot_osc": sig.pivot_osc_value,
+                "pivot_cvd": sig.pivot_cvd_value,
+                "slip_bps": sig.slip_bps,
+                "loc_at_pivot": sig.loc_at_pivot,
+                "oscillator": sig.oscillator_name,
+                "pine_div": sig.pine_div,
+                "cvd_div": sig.cvd_div,
+                "pivot_time_ms": sig.pivot_time_ms,
+                "confirm_time_ms": sig.confirm_time_ms,
+            })
+        except Exception:
+            log.exception("bot_events_csv_write_failed")
+
+        # tv_only: just compare
+        if self.tv_cfg.mode == "tv_only":
+            if key in self._pending_tv:
+                self._pending_tv.pop(key, None)
+                self._pending_bot.pop(key, None)
+                self._log_parity(key, tv=True, bot=True, action="match", details="tv_only")
+            else:
+                asyncio.create_task(self._parity_timeout_bot(key))
+            return
+
+        # tv_and_bot: trade only on match
+        if self.tv_cfg.mode == "tv_and_bot":
+            tv_sig = self._pending_tv.pop(key, None)
+            if tv_sig is None:
+                asyncio.create_task(self._parity_timeout_bot(key))
+                return
+            self._pending_bot.pop(key, None)
+            self._log_parity(key, tv=True, bot=True, action="match", details="tv_and_bot")
+            await self._execute_tradable_signal(sig, rt, source="TV+BOT")
+
+    async def _execute_tradable_signal(self, sig: Signal, rt: SymbolRuntime, source: str) -> None:
+        """Execute the shared signal pipeline for TV-driven trades.
+
+        This mirrors the live path in _on_bar_close, but:
+        - no cooldown gating (TV is already 1/bar)
+        - uses idempotency key to ensure once-per-confirm-bar
+        """
+        scfg = rt.cfg
+        if rt.desynced and self.parity_cfg.desync_pause:
+            self._log_signal_suppressed(sig, "desynced_state", {"source": source})
+            return
+
+        key = self._signal_key(sig)
+        if key in self._sent_alert_keys:
+            self._log_signal_suppressed(sig, "duplicate", {"idempotency_key": key, "source": source})
+            return
+
+        # Direction filter
+        direction = self.direction_gate.get_direction()
+        if direction == "long_only" and sig.side == "SHORT":
+            self._log_signal_suppressed(sig, "direction_filter", {"direction": direction, "source": source})
+            return
+        if direction == "short_only" and sig.side == "LONG":
+            self._log_signal_suppressed(sig, "direction_filter", {"direction": direction, "source": source})
+            return
+
+        now_ms = int(time.time() * 1000)
+        self._last_signal_ts_ms = now_ms
+        self._sent_alert_keys.add(key)
+
+        stop_preview = {
+            "enabled": scfg.stop_engine_params.enabled,
+            "ready": rt.stop_ready,
+            "htf_interval": scfg.stop_engine_params.htf_interval,
+            "htf_lookback_bars": scfg.stop_engine_params.htf_lookback_bars,
+            "atr_len": scfg.stop_engine_params.atr_len,
+            "atr": rt.h1_atr_value,
+            "buffer_bps": scfg.stop_engine_params.buffer_bps,
+            "k_init": scfg.stop_engine_params.k_init,
+            "tp_r_mult": scfg.stop_engine_params.tp_r_mult,
+            "trailing_enabled": scfg.stop_engine_params.trailing.enabled,
+            "trail_trigger_r": scfg.stop_engine_params.trailing.trigger_r,
+            "k_trail": scfg.stop_engine_params.trailing.k_trail,
+            "lock_r": scfg.stop_engine_params.trailing.lock_r,
+            "be_trigger_r": scfg.stop_engine_params.be_trigger_r,
+            "be_buffer_bps": scfg.stop_engine_params.be_buffer_bps,
+        }
+
+        orders_cfg = scfg.orders_cfg
+        notional = float(orders_cfg.get("notional_usdt", 25.0))
+        planned_qty = None
+        filters = None
+        try:
+            if self.rest:
+                filters = await self.rest.get_symbol_filters(sig.symbol)
+                planned_qty = quantize(notional / sig.entry_price, filters.step_size)
+        except Exception:
+            planned_qty = None
+            filters = None
+
+        # Preview SL/TP if stop engine is ready
+        if (
+            scfg.stop_engine_params.enabled
+            and rt.stop_ready
+            and rt.h1_bars
+            and rt.h1_atr_value is not None
+        ):
+            try:
+                recent = list(rt.h1_bars)[-scfg.stop_engine_params.htf_lookback_bars:]
+                struct_low = min(b.low for b in recent)
+                struct_high = max(b.high for b in recent)
+                tick_preview = filters.tick_size if filters else 0.0
+                sl0_raw, _ = compute_initial_sl(sig.entry_price, sig.side, struct_low, struct_high, rt.h1_atr_value, scfg.stop_engine_params)
+                sl0_q = quantize_sl(sl0_raw, sig.side, tick_preview)
+                R_q = abs(sig.entry_price - sl0_q)
+                tp0 = compute_tp_from_R(sig.entry_price, sig.side, R_q, scfg.stop_engine_params.tp_r_mult)
+                tp0_q = quantize_tp(tp0, sig.side, tick_preview)
+                stop_preview.update({"sl0": sl0_q, "tp0": tp0_q, "R": R_q})
+            except Exception as e:
+                log.warning("stop_preview_failed %s: %s", sig.symbol, e)
+
+        # Pre-trade alert
+        await self.notifier.send(
+            formatters.format_entry(
+                branding=f"{self.branding} [{source}]",
+                sig=sig,
+                strat_params=scfg.strategy_params,
+                stop_info=stop_preview,
+                divergence_mode=scfg.divergence_mode,
+                timeframe=self.timeframe,
+                testnet=self.testnet,
+                mode=self.mode,
+                exec_mode=self.exec_mode,
+                cooldown_minutes=self.cooldown_minutes,
+                max_positions_total=self.max_positions_total,
+                one_pos_per_symbol=scfg.position_cfg.get("one_position_per_symbol", True),
+                notional_usdt=notional,
+                planned_qty=planned_qty,
+            )
+        )
+
+        # Position rules
+        if scfg.position_cfg.get("one_position_per_symbol", True) and rt.in_position:
+            return
+        if self._positions_total >= self.max_positions_total:
+            return
+        if scfg.stop_engine_params.enabled and not rt.stop_ready:
+            self._log_signal_suppressed(sig, "stop_engine_not_ready", {"source": source})
+            return
+
+        if self.mode != "live" or not self._live_enabled:
+            return
+
+        if filters is None and self.rest:
+            filters = await self.rest.get_symbol_filters(sig.symbol)
+        if filters:
+            rt.filters = filters
+        if filters is None:
+            return
+
+        qty_raw = notional / sig.entry_price if sig.entry_price > 0 else 0.0
+        qty = quantize(qty_raw, filters.step_size)
+        lev = int(orders_cfg.get("leverage", 1))
+        if self.exec_mode == "binance" and self.rest:
+            await self.rest.set_leverage(sig.symbol, lev)
+        if qty < filters.min_qty:
+            err = RuntimeError(f"Qty too small for {sig.symbol}: {qty} < min {filters.min_qty}")
+            await self.notifier.send(
+                formatters.format_execution(
+                    branding=f"{self.branding} [{source}]",
+                    sig=sig,
+                    order={"orderId": "n/a", "status": "REJECTED"},
+                    qty=qty,
+                    leverage=lev,
+                    notional=notional,
+                    exec_mode=self.exec_mode,
+                    stop_info=stop_preview,
+                    error=err,
+                )
+            )
+            return
+
+        if self.executor is None:
+            return
+        rt.pending_signal = sig
+        res = await self.executor.place_entry(sig.symbol, sig.side, qty, ref=f"tv:{source}")
+        if not res.ok:
+            await self.notifier.send(
+                formatters.format_execution(
+                    branding=f"{self.branding} [{source}]",
+                    sig=sig,
+                    order={"orderId": "n/a", "status": res.msg},
+                    qty=qty,
+                    leverage=lev,
+                    notional=notional,
+                    exec_mode=self.exec_mode,
+                    stop_info=stop_preview,
+                    error=RuntimeError(res.msg),
+                )
+            )
+            return
+        fill_obj = res.fill
+        if fill_obj is None and self.exec_mode == "binance":
+            fill_obj = ExecFill(symbol=sig.symbol, side=sig.side, qty=qty, price=sig.entry_price, fee_paid=0.0, ts_ms=now_ms, mode="binance")
+        if fill_obj:
+            await self._on_fill(sig, fill_obj, filters)
 
     def _log_signal_suppressed(self, sig: Signal, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
         payload: Dict[str, Any] = {
@@ -538,6 +924,8 @@ class BotEngine:
                 volume=float(k["v"]),
                 close_time_ms=int(k["T"]),
             )
+            # keep a best-effort last price for sizing / external triggers
+            self.symbols_rt[sym].last_price = bar.close
             if interval == self.timeframe:
                 await self._on_bar_close(sym, bar)
             elif interval == self.symbol_cfgs[sym].stop_engine_params.htf_interval:
@@ -552,6 +940,7 @@ class BotEngine:
             is_buyer_maker = bool(data.get("m"))
             price = float(data.get("p"))
             rt = self.symbols_rt[sym]
+            rt.last_price = price
             if self.executor:
                 await self.executor.on_trade_tick(sym, price, ts)
             if rt.cfg.stop_engine_params.enabled and rt.stop_state:
@@ -816,6 +1205,14 @@ class BotEngine:
 
         sig = rt.strat.on_bar_close(bar)
         if not sig:
+            return
+
+        # If TradingView bridge is enabled, internal strategy signals are used
+        # only for parity/matching (depending on mode). Trading decisions can be
+        # driven by TV (tv_only) or by a TV+BOT handshake (tv_and_bot).
+        if self.tv_cfg.enabled and self.tv_cfg.mode in ("tv_only", "tv_and_bot"):
+            if emit_alerts:
+                await self._on_bot_signal_tv_mode(sig, rt)
             return
         if rt.desynced and self.parity_cfg.desync_pause and emit_alerts:
             self._log_signal_suppressed(sig, "desynced_state")

@@ -160,6 +160,7 @@ Per-symbol overrides live in `configs/pairs/<SYMBOL>.yaml`.
 - When controls are enabled, the startup alert includes inline buttons (LONG ONLY / SHORT ONLY / BOTH); only the allowed chat_id is honored.
 - Alert layout uses `<b>` + `<pre>` for aligned fields. Example (HTML rendered by Telegram):
   ```
+
   <b>📌 TRADE SIGNAL — ENTRY</b>
   <pre>
   SYM: BTCUSDT     | SIDE: LONG | TIME: 2025-12-26 10:15:00Z
@@ -174,6 +175,58 @@ Per-symbol overrides live in `configs/pairs/<SYMBOL>.yaml`.
   Loc@Pivot: 0.072 | DonLen: 120 | PivotLen: 5 | ExtBand: 0.10
   </pre>
   ```
+
+## TradingView webhook bridge (TV = signal engine)
+
+If you want *true production parity* with Pine, you can run a small webhook server **inside the bot** and let TradingView send the entry signals.
+
+Modes (config: `tv_bridge.mode`):
+
+- `tv_only` — **TV is boss**. Bot does risk + execution only. If TV says LONG, bot trades LONG (subject to safety gates).
+- `tv_and_bot` — **two-man rule**. Bot trades only if TV signal and bot strategy signal share the same `(symbol, side, confirm_time_ms)`.
+
+Config (see `configs/default.yaml`):
+
+```yaml
+tv_bridge:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9001
+  path: "/tv"
+  secret_env: "TV_WEBHOOK_SECRET"
+  mode: "tv_only"          # or: tv_and_bot
+  match_window_ms: 120000   # wait time for the other side (two-man + parity alerts)
+  alert_on_mismatch: true
+  require_tf_match: false
+```
+
+### TradingView alert payload (JSON)
+
+Your Pine script should `alert()` a JSON payload like:
+
+```json
+{
+  "secret": "<your-secret>",
+  "symbol": "{{ticker}}",
+  "tickerid": "{{exchange}}:{{ticker}}",
+  "tf": "{{interval}}",
+  "side": "LONG",
+  "confirm_time_ms": 1730000000000,
+  "entry_price": 105432.10,
+  "pivot_price": 105120.00,
+  "pivot_osc": 12.3456,
+  "slip_bps": 29.6,
+  "loc_at_pivot": 0.072
+}
+```
+
+Webhook URL: `http://<your-vm-ip>:9001/tv`
+
+### Notes
+
+- `confirm_time_ms` must be the **bar close timestamp (ms)** for the confirmation bar (what Pine calls `time_close`).
+- In `tv_only`, the bot will still compute its own signals and log parity mismatches (optional), but **trades are driven by TV**.
+- In `tv_and_bot`, mismatches are refused and (optionally) a Telegram “parity breach” alert is sent.
 
 ## Files you care about
 - `src/div_donchian_bot/cli.py` — entry point

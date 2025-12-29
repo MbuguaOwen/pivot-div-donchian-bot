@@ -11,6 +11,8 @@ class CsvStore:
         self.out.mkdir(parents=True, exist_ok=True)
         self.events_csv = self.out / "events.csv"
         self.trades_csv = self.out / "trades.csv"
+        self.tv_signals_csv = self.out / "tv_signals.csv"
+        self.parity_csv = self.out / "parity.csv"
         self._init_files()
 
     def _init_files(self) -> None:
@@ -27,6 +29,20 @@ class CsvStore:
                 ])
                 w.writeheader()
 
+        if not self.tv_signals_csv.exists():
+            with self.tv_signals_csv.open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=[
+                    "ts_ms","symbol","side","confirm_time_ms","tf","entry_price","pivot_price","pivot_osc","slip_bps","loc_at_pivot","tickerid"
+                ])
+                w.writeheader()
+
+        if not self.parity_csv.exists():
+            with self.parity_csv.open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=[
+                    "ts_ms","mode","symbol","side","confirm_time_ms","tv","bot","action","details"
+                ])
+                w.writeheader()
+
     def log_event(self, d: Dict[str, Any]) -> None:
         with self.events_csv.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
@@ -38,5 +54,19 @@ class CsvStore:
         with self.trades_csv.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
                 "ts_ms","symbol","side","order_id","status","qty","entry_price","sl","tp","mode"
+            ])
+            w.writerow(d)
+
+    def log_tv_signal(self, d: Dict[str, Any]) -> None:
+        with self.tv_signals_csv.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "ts_ms","symbol","side","confirm_time_ms","tf","entry_price","pivot_price","pivot_osc","slip_bps","loc_at_pivot","tickerid"
+            ])
+            w.writerow(d)
+
+    def log_parity(self, d: Dict[str, Any]) -> None:
+        with self.parity_csv.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "ts_ms","mode","symbol","side","confirm_time_ms","tv","bot","action","details"
             ])
             w.writerow(d)
