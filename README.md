@@ -228,6 +228,29 @@ Webhook URL: `http://<your-vm-ip>:9001/tv`
 - In `tv_only`, the bot will still compute its own signals and log parity mismatches (optional), but **trades are driven by TV**.
 - In `tv_and_bot`, mismatches are refused and (optionally) a Telegram “parity breach” alert is sent.
 
+## Historical Replay
+- Export TradingView Strategy Tester trades to CSV (List of Trades → Export).
+- Convert to canonical `tv_signals.csv` (defaults to Binance close_time_ms = period_end-1):
+  ```bash
+  python -m div_donchian_bot.cli.tv_export_to_signals --in exported_trades.csv --out artifacts/tv_signals.csv --symbol BTCUSDT --side_map auto
+  ```
+- Offline parity check (same as before):
+  ```bash
+  python -m div_donchian_bot.cli.parity_check --bars_csv artifacts/bars_1m.csv --tv_signals_csv artifacts/tv_signals.csv --config configs/default.yaml
+  ```
+- Replay strategy-only across 15m/1h/4h (1m input auto-resampled, metrics + bot_signals per tf):
+  ```bash
+  python -m div_donchian_bot.cli.replay --config configs/default.yaml --bars_csv artifacts/bars_1m.csv --tv_signals_csv artifacts/tv_signals.csv --timeframes 15m,1h,4h --mode strategy_only --start 1700000000000 --end 1700003600000
+  ```
+- Replay the full engine in paper mode (structure/ATR + paper fills, requires aggTrades when CVD enabled):
+  ```bash
+  python -m div_donchian_bot.cli.replay --config configs/default.yaml --bars_csv artifacts/bars_1m.csv --agg_csv artifacts/agg_trades.csv --timeframes 15m,1h,4h --mode engine_paper --out_dir artifacts/replay
+  ```
+- Fire signals into a running `/tv` webhook endpoint:
+  ```bash
+  python -m div_donchian_bot.cli.replay_tv_webhooks --tv_signals_csv artifacts/tv_signals.csv --url http://127.0.0.1:9001/tv --secret_env TV_WEBHOOK_SECRET --sleep 0
+  ```
+
 ## Files you care about
 - `src/div_donchian_bot/cli.py` — entry point
 - `src/div_donchian_bot/engine.py` — orchestrator

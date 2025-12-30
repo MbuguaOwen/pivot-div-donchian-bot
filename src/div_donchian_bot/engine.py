@@ -852,7 +852,7 @@ class BotEngine:
             self._log_signal_suppressed(sig, "stop_engine_not_ready", {"source": source})
             return
 
-        if self.mode != "live" or not self._live_enabled:
+        if self.exec_mode != "paper" and (self.mode != "live" or not self._live_enabled):
             return
 
         if filters is None and self.rest:
@@ -1408,7 +1408,7 @@ class BotEngine:
             self._log_signal_suppressed(sig, "stop_engine_not_ready")
             return
 
-        if self.mode != "live" or not self._live_enabled:
+        if self.exec_mode != "paper" and (self.mode != "live" or not self._live_enabled):
             return
 
         if filters is None and self.rest:
