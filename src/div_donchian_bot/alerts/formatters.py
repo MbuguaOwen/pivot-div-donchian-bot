@@ -122,13 +122,30 @@ def format_entry(
         f"{osc_line}",
         f"Loc@Pivot: {sig.loc_at_pivot:.3f} | DonLen: {strat_params.don_len} | PivotLen: {strat_params.pivot_len} | ExtBand: {strat_params.ext_band_pct:.2f}",
     ])
-    risk_block = _pre([
+    risk_lines = [
         f"Engine: {stop_info.get('enabled', False)} ready={stop_info.get('ready', False)} trailing={stop_info.get('trailing_enabled', False)}",
         f"HTF: {escape(stop_info.get('htf_interval', 'n/a'))} lookback={stop_info.get('htf_lookback_bars', 'n/a')} ATR{stop_info.get('atr_len', 'n/a')}: {stop_info.get('atr', 'n/a')}",
         f"Buf: {stop_info.get('buffer_bps', 'n/a')}bps | k_init: {stop_info.get('k_init', 'n/a')} | TPx: {stop_info.get('tp_r_mult', 'n/a')} | BE: {stop_info.get('be_trigger_r', 'n/a')}R @ {stop_info.get('be_buffer_bps', 'n/a')}bps",
         f"SL0: {stop_info.get('sl0', 'n/a')} | TP0: {stop_info.get('tp0', 'n/a')} | R: {stop_info.get('R', 'n/a')}",
         f"Trail trig: {stop_info.get('trail_trigger_r', 'n/a')}R | k_trail: {stop_info.get('k_trail', 'n/a')} | lock: {stop_info.get('lock_r', 'n/a')}",
-    ])
+    ]
+
+    # Optional: CVD pressure confirmation context
+    cvd_mode = stop_info.get("cvd_filter") or stop_info.get("cvd_mode")
+    signed = stop_info.get("signed_delta")
+    thresh = stop_info.get("signed_delta_threshold")
+    window = stop_info.get("delta_window_m")
+    if cvd_mode and cvd_mode != "off" and signed is not None and thresh is not None:
+        try:
+            w = int(window) if window is not None else 15
+        except Exception:
+            w = 15
+        try:
+            risk_lines.append(f"CVD Pressure: signed_delta_{w}m={float(signed):.2f} > {float(thresh):.2f} | mode={cvd_mode}")
+        except Exception:
+            risk_lines.append(f"CVD Pressure: signed_delta_{w}m={signed} > {thresh} | mode={cvd_mode}")
+
+    risk_block = _pre(risk_lines)
     exec_block = _pre([
         f"Mode: {mode.upper()} | Notional: ${notional_usdt} | Qty: {planned_qty if planned_qty is not None else 'n/a'}",
     ])
@@ -149,6 +166,7 @@ def format_execution(
     fill: Optional[ExecFill] = None,
     error: Optional[Exception] = None,
     stop_info: Optional[Dict[str, Any]] = None,
+    extra_lines: Optional[List[str]] = None,
 ) -> str:
     header = f"<b>{ICON} EXECUTION RESULT</b>"
     sig_block_lines = [
@@ -176,7 +194,10 @@ def format_execution(
     err_block: List[str] = []
     if error is not None:
         err_block = ["<b>Error</b>", _pre([f"{escape(error)}"])]
-    parts = [header, sig_block, "<b>Order</b>", ord_block, "<b>Risk</b>", risk_block]
+    parts: List[str] = [header]
+    if extra_lines:
+        parts.append(_pre(extra_lines))
+    parts.extend([sig_block, "<b>Order</b>", ord_block, "<b>Risk</b>", risk_block])
     parts.extend(err_block)
     parts.append(_footer(branding))
     return _truncate("\n".join(parts))

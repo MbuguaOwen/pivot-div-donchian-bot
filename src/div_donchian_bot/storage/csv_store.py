@@ -13,6 +13,7 @@ class CsvStore:
         self.trades_csv = self.out / "trades.csv"
         self.tv_signals_csv = self.out / "tv_signals.csv"
         self.parity_csv = self.out / "parity.csv"
+        self.cvd_filter_csv = self.out / "cvd_filter.csv"
         self._init_files()
 
     def _init_files(self) -> None:
@@ -43,6 +44,13 @@ class CsvStore:
                 ])
                 w.writeheader()
 
+        if not self.cvd_filter_csv.exists():
+            with self.cvd_filter_csv.open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=[
+                    "ts_ms","symbol","side","confirm_time_ms","end_ms","delta_window_m","delta_sum","signed_delta","thresh","pass","ok","reason","align","gaps","mode","source"
+                ])
+                w.writeheader()
+
     def log_event(self, d: Dict[str, Any]) -> None:
         with self.events_csv.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
@@ -68,5 +76,12 @@ class CsvStore:
         with self.parity_csv.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
                 "ts_ms","mode","symbol","side","confirm_time_ms","tv","bot","action","details"
+            ])
+            w.writerow(d)
+
+    def log_cvd_filter(self, d: Dict[str, Any]) -> None:
+        with self.cvd_filter_csv.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "ts_ms","symbol","side","confirm_time_ms","end_ms","delta_window_m","delta_sum","signed_delta","thresh","pass","ok","reason","align","gaps","mode","source"
             ])
             w.writerow(d)

@@ -1,6 +1,6 @@
 run:
   mode: live         # paper | live
-  timeframe: "1h"
+  timeframe: "15m"
 
 exchange:
   market_type: futures # futures | spot
@@ -81,7 +81,9 @@ risk:
 
     # 2) Cap stop if structure is huge
     atr_len: 24
-    k_init: 20.8             # cap = 1.8 * ATR(1h,24)
+    # Minimum R distance as % of entry (bps). Prevents toy-tight stops in low vol.
+    atr_floor_bps: 15
+    k_init: 15.8             # cap = 1.8 * ATR(1h,24)
 
     # 3) Fixed RR take-profit
     tp_r_mult: 2.0          # TP = 2R
@@ -130,7 +132,7 @@ telegram:
   controls_state_path: "state/telegram_controls.json"
 
 tv_bridge:
-  enabled: true
+  enabled: false
   host: "0.0.0.0"
   port: 9001
   path: "/tv"
@@ -143,8 +145,15 @@ tv_bridge:
   alert_on_mismatch: true
   require_tf_match: false
 
+# CVD pressure confirmation (signed delta) - independent of divergence mode
+cvd:
+  mode: "filter"                 # off | shadow | filter
+  delta_window_minutes: 15
+  signed_delta_threshold: 50
+  warmup_minutes: 60
+
 healthcheck:
-  enabled: true
+  enabled: false
   # Default hits the local tv_bridge /health endpoint over loopback
   url: "http://127.0.0.1:9001/health"
   interval_seconds: 60

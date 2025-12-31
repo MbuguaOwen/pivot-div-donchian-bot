@@ -119,6 +119,45 @@ def test_update_stop_monotonic_long():
     assert new_sl == pytest.approx(108.0)
 
 
+def test_compute_initial_sl_respects_atr_floor_bps():
+    params = StructureAtrTrailParams(
+        enabled=True,
+        buffer_bps=0,
+        atr_floor_bps=20,  # 0.20%
+        k_init=1.8,
+        tp_r_mult=2.0,
+        be_trigger_r=1.0,
+        be_buffer_bps=10,
+        trailing=TrailingParams(enabled=False, trigger_r=2.5, k_trail=1.6, lock_r=1.0),
+    )
+
+    entry = 100.0
+    atr = 10.0
+
+    # Structure stop would be only 0.01 away, but floor should expand to 0.20
+    sl0, R = compute_initial_sl(
+        entry=entry,
+        side="LONG",
+        struct_low=99.99,
+        struct_high=110.0,
+        atr=atr,
+        params=params,
+    )
+    assert sl0 == pytest.approx(99.8)
+    assert R == pytest.approx(0.2)
+
+    sl1, R1 = compute_initial_sl(
+        entry=entry,
+        side="SHORT",
+        struct_low=80.0,
+        struct_high=100.01,
+        atr=atr,
+        params=params,
+    )
+    assert sl1 == pytest.approx(100.2)
+    assert R1 == pytest.approx(0.2)
+
+
 def test_update_stop_monotonic_short():
     params = _make_params(trailing_enabled=True)
     state = StopState(

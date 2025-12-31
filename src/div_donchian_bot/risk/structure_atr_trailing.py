@@ -20,6 +20,9 @@ class StructureAtrTrailParams:
     htf_interval: str = "1h"
     htf_lookback_bars: int = 72
     atr_len: int = 24
+    # Minimum R distance as a % of entry, expressed in basis points (bps).
+    # Example: 20 bps = 0.20%.
+    atr_floor_bps: float = 0.0
     k_init: float = 1.8
     tp_r_mult: float = 2.0
     buffer_bps: float = 10.0
@@ -77,6 +80,16 @@ def compute_initial_sl(
         capped = params.k_init * atr
         sl0 = entry + capped if stop_dist > capped else sl_struct
         R = sl0 - entry
+
+    # ATR floor: prevent toy-tight risk in low-vol regimes
+    floor_dist = entry * _bps_to_float(params.atr_floor_bps) if params.atr_floor_bps and params.atr_floor_bps > 0 else 0.0
+    if floor_dist > 0 and R < floor_dist:
+        if side == "LONG":
+            sl0 = entry - floor_dist
+            R = floor_dist
+        else:
+            sl0 = entry + floor_dist
+            R = floor_dist
 
     return sl0, R
 

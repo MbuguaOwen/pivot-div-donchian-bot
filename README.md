@@ -64,6 +64,36 @@ strategy:
 ```
 ⚠️ CVD requires subscribing to **aggTrades**, which is bandwidth-heavy for a huge symbol set. The bot only opens aggTrade streams for symbols whose divergence mode needs it; prefer a curated symbol list when enabling CVD.
 
+## CVD pressure confirmation (signed delta filter)
+
+This is **not divergence**. It’s a microstructure **directional pressure gate** computed from Binance `aggTrade`:
+
+- `delta_1m = buy_qty - sell_qty` per minute (aligned to Binance minute close `...:59.999`).
+- `delta_15m = sum(delta_1m)` over the last 15 minutes ending at `confirm_time_ms`.
+- `signed_delta_15m = delta_15m` for LONG, `-delta_15m` for SHORT.
+
+Filter rule (default):
+- LONG: `delta_15m >= +50`
+- SHORT: `delta_15m <= -50`
+
+Config (top-level `cvd:`):
+```yaml
+cvd:
+  mode: "off"                 # off | shadow | filter
+  delta_window_minutes: 15
+  signed_delta_threshold: 50
+  warmup_minutes: 60           # fail-closed in filter mode until warmup is satisfied
+```
+
+Modes:
+- `off`: no computation, no gating.
+- `shadow`: compute + log `CVD_FILTER,...` but **do not block** trades.
+- `filter`: **block entries** unless the signed-delta threshold passes (and the store is warmed up).
+
+Every candidate entry (BOT or TV) logs one line:
+`CVD_FILTER,side=...,symbol=...,confirm_ms=...,delta_15m=...,signed=...,thresh=...,pass=...,...`
+and a CSV is written to `artifacts/<run_id>/cvd_filter.csv` for reproducibility.
+
 ## HTF structure risk engine
 Single risk engine (no separate ATR SL/TP module). In `configs/default.yaml`:
 ```yaml
@@ -74,6 +104,7 @@ risk:
     htf_lookback_bars: 72
     buffer_bps: 10
     atr_len: 24
+    atr_floor_bps: 20
     k_init: 1.8
     tp_r_mult: 2.0
     be_trigger_r: 1.0
@@ -87,6 +118,7 @@ risk:
     min_stop_tick_improvement: 2
 ```
 - SL0: structure low/high ± buffer, capped by `k_init * ATR(1h,24)` (closer stop wins).
+- **ATR floor**: if the resulting `R = |entry − SL0|` is too small, it is expanded to `max(R, entry * atr_floor_bps / 10000)`.
 - R = |entry − SL0|; TP = entry ± `tp_r_mult * R` (default 2R).
 - Break-even at `be_trigger_r` with `be_buffer_bps` buffer; stop is monotonic.
 - Trailing (optional): trigger at `trailing.trigger_r`, lock at `lock_r * R`, trail by `max(k_trail * ATR(1h,24), (trigger_r-lock_r)*R)`.
@@ -184,6 +216,7 @@ Modes (config: `tv_bridge.mode`):
 
 - `tv_only` — **TV is boss**. Bot does risk + execution only. If TV says LONG, bot trades LONG (subject to safety gates).
 - `tv_and_bot` — **two-man rule**. Bot trades only if TV signal and bot strategy signal share the same `(symbol, side, confirm_time_ms)`.
+- Option A parity: `/tv` webhook is authoritative. `confirm_time_ms` is treated as the canonical bar close (Binance kline `T - 1ms`); entries are placed immediately on webhook receipt with SL/TP, and websocket klines are used only for trailing/BE/state—not to delay entry.
 
 Config (see `configs/default.yaml`):
 

@@ -35,6 +35,8 @@ from .alerts import formatters
 from .direction import DirectionGate
 from .telegram_controls import TelegramControls, control_keyboard
 from .tv_bridge import TvBridgeConfig, TvWebhookServer, TvSignal
+from .orderflow.delta_store import Delta1mStore
+from .time_utils import canonical_close_ms, binance_kline_close_to_confirm_ms
 
 log = logging.getLogger("engine")
 
@@ -68,10 +70,26 @@ class SymbolConfig:
     strategy_params: StrategyParams
     stop_engine_params: StructureAtrTrailParams
     enable_cvd: bool
+    cvd_pressure: CvdPressureConfig
     orders_cfg: Dict[str, Any]
     position_cfg: Dict[str, Any]
     divergence_mode: str
     parity: ParityConfig
+
+
+@dataclass
+class CvdPressureConfig:
+    """Microstructure pressure confirmation using signed delta over a rolling window."""
+
+    # off | shadow | filter
+    mode: str = "off"
+    delta_window_minutes: int = 15
+    signed_delta_threshold: float = 50.0
+    warmup_minutes: int = 60
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode in ("shadow", "filter")
 
 @dataclass
 class ParityConfig:
@@ -101,9 +119,12 @@ class SymbolRuntime:
     in_position: bool = False
     last_signal_ts_ms: int = 0
     last_bar_open_ms: Optional[int] = None
+    last_kline_close_ms: Optional[int] = None
     last_price: Optional[float] = None
     desynced: bool = False
     desync_warned: bool = False
+    delta_store: Optional[Delta1mStore] = None
+    delta_store: Optional[Delta1mStore] = None
 
 class BotEngine:
     def __init__(self, cfg: Dict[str, Any]):
@@ -167,6 +188,7 @@ class BotEngine:
         self.tv_server: Optional[TvWebhookServer] = None
         self._pending_tv: Dict[tuple[str, str, int, str], TvSignal] = {}
         self._pending_bot: Dict[tuple[str, str, int, str], Signal] = {}
+        self._tv_seen: set[tuple[str, str, int]] = set()
         self.controls: Optional[TelegramControls] = None
         self.controls_enabled = bool(tg_cfg.get("controls_enabled", False))
         self.controls_allowed_chat_id = tg_cfg.get("controls_allowed_chat_id")
@@ -246,12 +268,15 @@ class BotEngine:
 
         # Build per-symbol runtime/config
         cvd_symbols: List[str] = []
+        cvd_filter_symbols: List[str] = []
         stop_engine_symbols: List[str] = []
         for sym in symbols:
             scfg = self._build_symbol_config(sym)
             self.symbol_cfgs[sym] = scfg
             if scfg.enable_cvd:
                 cvd_symbols.append(sym)
+            if scfg.cvd_pressure.enabled:
+                cvd_filter_symbols.append(sym)
             if scfg.stop_engine_params.enabled:
                 stop_engine_symbols.append(sym)
                 h1_maxlen = scfg.stop_engine_params.htf_lookback_bars + scfg.stop_engine_params.atr_len + 5
@@ -260,11 +285,18 @@ class BotEngine:
             else:
                 h1_bars = None
                 h1_atr = None
+            delta_store = None
+            if scfg.cvd_pressure.enabled:
+                # Keep enough minutes for warmup + window + small safety.
+                max_minutes = max(120, scfg.cvd_pressure.warmup_minutes + scfg.cvd_pressure.delta_window_minutes + 10)
+                delta_store = Delta1mStore(max_minutes=max_minutes)
+
             self.symbols_rt[sym] = SymbolRuntime(
                 cfg=scfg,
                 strat=SymbolStrategyState(sym, scfg.strategy_params, enable_cvd=scfg.enable_cvd),
                 h1_atr=h1_atr,
                 h1_bars=h1_bars,
+                delta_store=delta_store,
             )
 
         for sym in symbols:
@@ -304,16 +336,22 @@ class BotEngine:
         trade_streams = [
             f"{s.lower()}@aggTrade"
             for s in symbols
-            if self.symbol_cfgs[s].enable_cvd or self.symbol_cfgs[s].stop_engine_params.enabled or self.exec_mode == "paper"
+            if (
+                self.symbol_cfgs[s].enable_cvd
+                or self.symbol_cfgs[s].cvd_pressure.enabled
+                or self.symbol_cfgs[s].stop_engine_params.enabled
+                or self.exec_mode == "paper"
+            )
         ]
         # Deduplicate while preserving order
         all_streams = list(dict.fromkeys(kline_streams + h1_streams + trade_streams))
         log.info(
-            "Streams: kline=%d htf=%d aggTrade=%d cvd_symbols=%d stop_engine=%d",
+            "Streams: kline=%d htf=%d aggTrade=%d cvd_div_symbols=%d cvd_filter_symbols=%d stop_engine=%d",
             len(kline_streams),
             len(h1_streams),
             len(trade_streams),
             len(cvd_symbols),
+            len(cvd_filter_symbols),
             len(stop_engine_symbols),
         )
 
@@ -378,16 +416,30 @@ class BotEngine:
         )
         enable_cvd = divergence_mode in ("cvd", "both", "either")
 
+        # CVD pressure confirmation (signed delta over window) - independent of divergence mode
+        cvd_cfg = merged.get("cvd", {}) or {}
+        cvd_mode = str(cvd_cfg.get("mode", "off")).lower()
+        if cvd_mode not in ("off", "shadow", "filter"):
+            cvd_mode = "off"
+        cvd_pressure = CvdPressureConfig(
+            mode=cvd_mode,
+            delta_window_minutes=int(cvd_cfg.get("delta_window_minutes", 15)),
+            signed_delta_threshold=float(cvd_cfg.get("signed_delta_threshold", 50)),
+            warmup_minutes=int(cvd_cfg.get("warmup_minutes", 60)),
+        )
+
         # risk.engine config block
         risk_cfg = merged.get("risk", {}).get("engine", {}) or {}
         trailing_cfg = risk_cfg.get("trailing", {}) or {}
+        tp_r_mult = float(risk_cfg.get("tp_r_mult", risk_cfg.get("tp_r", 2.0)))
         stop_engine_params = StructureAtrTrailParams(
             enabled=bool(risk_cfg.get("enabled", False)),
             htf_interval=str(risk_cfg.get("htf_interval", "1h")).lower(),
             htf_lookback_bars=int(risk_cfg.get("htf_lookback_bars", 72)),
             atr_len=int(risk_cfg.get("atr_len", 24)),
+            atr_floor_bps=float(risk_cfg.get("atr_floor_bps", 0.0)),
             k_init=float(risk_cfg.get("k_init", 1.8)),
-            tp_r_mult=float(risk_cfg.get("tp_r_mult", 2.0)),
+            tp_r_mult=tp_r_mult,
             buffer_bps=float(risk_cfg.get("buffer_bps", 10.0)),
             be_trigger_r=float(risk_cfg.get("be_trigger_r", 1.0)),
             be_buffer_bps=float(risk_cfg.get("be_buffer_bps", 10.0)),
@@ -410,6 +462,7 @@ class BotEngine:
             strategy_params=p,
             stop_engine_params=stop_engine_params,
             enable_cvd=enable_cvd,
+            cvd_pressure=cvd_pressure,
             orders_cfg=orders_cfg,
             position_cfg=position_cfg,
             divergence_mode=divergence_mode,
@@ -444,6 +497,7 @@ class BotEngine:
             rt.last_bar_open_ms = b.open_time_ms
         if closed:
             rt.last_bar_open_ms = closed[-1].open_time_ms
+            rt.last_kline_close_ms = closed[-1].close_time_ms
 
     async def _warmup_stop_engine(self, symbol: str, rt: SymbolRuntime) -> None:
         params = rt.cfg.stop_engine_params
@@ -523,6 +577,121 @@ class BotEngine:
 
     def _tv_key(self, symbol: str, side: Side, confirm_time_ms: int) -> tuple[str, str, int, str]:
         return (symbol, self.timeframe, confirm_time_ms, side)
+
+    def _align_confirm_ms_for_delta(self, confirm_time_ms: int) -> tuple[int, str]:
+        """Align confirm_time_ms to a minute close (end-1ms).
+
+        - Binance kline close_time_ms is already end-1ms (....59999)
+        - TradingView `time_close` is typically the *boundary* timestamp (....00000)
+        """
+        ct = int(confirm_time_ms)
+        if ct % 60_000 == 59_999:
+            return ct, "already_close"
+        if ct % 60_000 == 0:
+            return ct - 1, "minus1"
+        return ct, "unaligned"
+
+    def _eval_cvd_pressure(self, symbol: str, rt: SymbolRuntime, side: Side, confirm_time_ms: int, source: str) -> tuple[bool, Dict[str, Any]]:
+        """Evaluate signed-delta pressure confirmation.
+
+        Returns:
+          (should_continue, diag)
+
+        should_continue:
+          - True  : continue pipeline (mode off/shadow, or filter passes)
+          - False : block signal/trade (filter mode and gate fails or history insufficient)
+        """
+        cfg = rt.cfg.cvd_pressure
+        if not cfg.enabled or rt.delta_store is None:
+            return True, {"cvd_filter": "off"}
+
+        end_ms, align_reason = self._align_confirm_ms_for_delta(confirm_time_ms)
+        if align_reason == "unaligned":
+            # fail-closed in filter mode, but still log in shadow
+            ok = False
+            delta_sum = 0.0
+            res_reason = "confirm_ms_unaligned"
+            minutes_found = 0
+            minutes_needed = cfg.delta_window_minutes + max(0, cfg.warmup_minutes)
+        else:
+            res = rt.delta_store.get_delta_sum(
+                end_ms=end_ms,
+                window_minutes=cfg.delta_window_minutes,
+                warmup_minutes=cfg.warmup_minutes,
+            )
+            ok = res.ok
+            delta_sum = float(res.delta_sum)
+            res_reason = res.reason
+            minutes_found = res.minutes_found
+            minutes_needed = res.minutes_needed
+
+        signed = delta_sum if side == "LONG" else -delta_sum
+        passed = int(ok and (signed > cfg.signed_delta_threshold))
+
+        diag: Dict[str, Any] = {
+            "cvd_filter": cfg.mode,
+            "delta_window_m": cfg.delta_window_minutes,
+            "signed_delta_threshold": cfg.signed_delta_threshold,
+            "confirm_time_ms": int(confirm_time_ms),
+            "end_ms": int(end_ms),
+            "align": align_reason,
+            "delta_sum": delta_sum,
+            "signed_delta": signed,
+            "pass": passed,
+            "ok": int(ok),
+            "reason": res_reason,
+            "minutes_found": minutes_found,
+            "minutes_needed": minutes_needed,
+            "gaps": int(rt.delta_store.gap_count) if rt.delta_store else 0,
+            "source": source,
+        }
+
+        # Always log on trigger (pass or fail)
+        log.info(
+            "CVD_FILTER,side=%s,symbol=%s,confirm_ms=%d,delta_%dm=%.6f,signed=%.6f,thresh=%.6f,pass=%d,ok=%d,reason=%s,align=%s,source=%s",
+            side,
+            symbol,
+            int(confirm_time_ms),
+            cfg.delta_window_minutes,
+            delta_sum,
+            signed,
+            cfg.signed_delta_threshold,
+            passed,
+            int(ok),
+            res_reason,
+            align_reason,
+            source,
+        )
+        try:
+            self.store.log_cvd_filter({
+                "ts_ms": int(time.time() * 1000),
+                "symbol": symbol,
+                "side": side,
+                "confirm_time_ms": int(confirm_time_ms),
+                "end_ms": int(end_ms),
+                "delta_window_m": cfg.delta_window_minutes,
+                "delta_sum": delta_sum,
+                "signed_delta": signed,
+                "thresh": cfg.signed_delta_threshold,
+                "pass": passed,
+                "ok": int(ok),
+                "reason": res_reason,
+                "align": align_reason,
+                "gaps": int(rt.delta_store.gap_count) if rt.delta_store else 0,
+                "mode": cfg.mode,
+                "source": source,
+            })
+        except Exception:
+            log.exception("cvd_filter_csv_write_failed")
+
+        if cfg.mode == "shadow":
+            return True, diag
+
+        # filter mode: fail-closed on insufficient history or mismatches
+        if cfg.mode == "filter":
+            return bool(passed), diag
+
+        return True, diag
 
     async def _maybe_healthcheck(self, now_ms: int) -> None:
         if not self.health_enabled or not self.health_url:
@@ -612,6 +781,7 @@ class BotEngine:
             entry = rt.last_price
         if entry is None:
             entry = 0.0
+        confirm_ms = canonical_close_ms(tv.confirm_time_ms)
         return Signal(
             symbol=tv.symbol,
             side=tv.side,
@@ -624,8 +794,9 @@ class BotEngine:
             oscillator_name="tv",
             pine_div=True,
             cvd_div=False,
-            pivot_time_ms=int(tv.confirm_time_ms),
-            confirm_time_ms=int(tv.confirm_time_ms),
+            pivot_time_ms=int(confirm_ms),
+            confirm_time_ms=int(confirm_ms),
+            source="TV",
         )
 
     async def _on_tv_signal(self, tv: TvSignal) -> None:
@@ -645,7 +816,19 @@ class BotEngine:
             if tv.tf != self.timeframe:
                 log.info("tv_bridge_tf_mismatch symbol=%s tv_tf=%s bot_tf=%s", symbol, tv.tf, self.timeframe)
 
+        tv.confirm_time_ms = canonical_close_ms(tv.confirm_time_ms)
         now_ms = int(time.time() * 1000)
+        latency_ms = now_ms - tv.confirm_time_ms
+        log.info(
+            "tv_webhook_received symbol=%s side=%s confirm_ms=%d tf=%s ticker=%s latency_ms=%d",
+            tv.symbol,
+            tv.side,
+            tv.confirm_time_ms,
+            tv.tf or "",
+            tv.tickerid or "",
+            latency_ms,
+        )
+
         try:
             self.store.log_tv_signal({
                 "ts_ms": now_ms,
@@ -663,8 +846,41 @@ class BotEngine:
         except Exception:
             log.exception("tv_signals_csv_write_failed")
 
-        key = self._tv_key(tv.symbol, tv.side, tv.confirm_time_ms)
         rt = self.symbols_rt[tv.symbol]
+        tf_ms = _tf_to_minutes(self.timeframe) * 60 * 1000
+        last_close = rt.last_kline_close_ms
+        delta_ms = None
+        timing_status = "no_kline"
+        if last_close is not None:
+            delta_ms = tv.confirm_time_ms - last_close
+            if abs(delta_ms) <= tf_ms:
+                timing_status = "aligned"
+            elif delta_ms < -tf_ms:
+                timing_status = "stale"
+            else:
+                timing_status = "ahead"
+        log.info(
+            "tv_time_check symbol=%s side=%s confirm_ms=%d last_close_ms=%s delta_ms=%s status=%s tf_ms=%d",
+            tv.symbol,
+            tv.side,
+            tv.confirm_time_ms,
+            last_close,
+            delta_ms,
+            timing_status,
+            tf_ms,
+        )
+        dedupe_key = (tv.symbol, tv.side, tv.confirm_time_ms)
+        if dedupe_key in self._tv_seen:
+            log.info("tv_webhook_dedupe_skip symbol=%s side=%s confirm_ms=%d", tv.symbol, tv.side, tv.confirm_time_ms)
+            return
+        self._tv_seen.add(dedupe_key)
+        if timing_status == "stale":
+            log.info("tv_webhook_stale_skip symbol=%s side=%s confirm_ms=%d last_close_ms=%s", tv.symbol, tv.side, tv.confirm_time_ms, last_close)
+            return
+
+        key = self._tv_key(tv.symbol, tv.side, tv.confirm_time_ms)
+
+        key = self._tv_key(tv.symbol, tv.side, tv.confirm_time_ms)
 
         # tv_only: TV is boss
         if self.tv_cfg.mode == "tv_only":
@@ -678,6 +894,7 @@ class BotEngine:
                 asyncio.create_task(self._parity_timeout_tv(key))
 
             sig = self._signal_from_tv(tv, rt)
+            sig.latency_ms = latency_ms
             await self._execute_tradable_signal(sig, rt, source="TV")
             return
 
@@ -692,6 +909,7 @@ class BotEngine:
             # matched
             self._pending_tv.pop(key, None)
             self._log_parity(key, tv=True, bot=True, action="match", details="tv_and_bot")
+            bot_sig.latency_ms = latency_ms
             await self._execute_tradable_signal(bot_sig, rt, source="TV+BOT")
             return
 
@@ -750,6 +968,9 @@ class BotEngine:
         - uses idempotency key to ensure once-per-confirm-bar
         """
         scfg = rt.cfg
+        sig.source = source
+        if sig.latency_ms is None:
+            sig.latency_ms = int(time.time() * 1000) - sig.confirm_time_ms
         if rt.desynced and self.parity_cfg.desync_pause:
             self._log_signal_suppressed(sig, "desynced_state", {"source": source})
             return
@@ -766,6 +987,13 @@ class BotEngine:
             return
         if direction == "short_only" and sig.side == "LONG":
             self._log_signal_suppressed(sig, "direction_filter", {"direction": direction, "source": source})
+            return
+
+        # CVD pressure confirmation gate for TV-driven trades as well
+        cvd_ok, cvd_diag = self._eval_cvd_pressure(sig.symbol, rt, sig.side, sig.confirm_time_ms, source=source)
+        if not cvd_ok:
+            self._log_signal_suppressed(sig, "cvd_pressure_filter", cvd_diag)
+            self._sent_alert_keys.add(key)
             return
 
         now_ms = int(time.time() * 1000)
@@ -789,6 +1017,17 @@ class BotEngine:
             "be_trigger_r": scfg.stop_engine_params.be_trigger_r,
             "be_buffer_bps": scfg.stop_engine_params.be_buffer_bps,
         }
+
+        # Include CVD pressure context in notifications (pass-only)
+        if isinstance(cvd_diag, dict) and rt.cfg.cvd_pressure.enabled:
+            stop_preview.update({
+                "cvd_mode": rt.cfg.cvd_pressure.mode,
+                "delta_window_m": cvd_diag.get("delta_window_m"),
+                "delta_sum": cvd_diag.get("delta_sum"),
+                "signed_delta": cvd_diag.get("signed_delta"),
+                "signed_delta_threshold": cvd_diag.get("signed_delta_threshold"),
+                "cvd_ok": cvd_diag.get("ok"),
+            })
 
         orders_cfg = scfg.orders_cfg
         notional = float(orders_cfg.get("notional_usdt", 25.0))
@@ -855,6 +1094,8 @@ class BotEngine:
         if self.exec_mode != "paper" and (self.mode != "live" or not self._live_enabled):
             return
 
+        if filters is None and rt.filters:
+            filters = rt.filters
         if filters is None and self.rest:
             filters = await self.rest.get_symbol_filters(sig.symbol)
         if filters:
@@ -888,6 +1129,19 @@ class BotEngine:
             return
         rt.pending_signal = sig
         res = await self.executor.place_entry(sig.symbol, sig.side, qty, ref=f"tv:{source}")
+        if source.startswith("TV"):
+            order_id = None
+            if res.order_ids and isinstance(res.order_ids, dict):
+                order_id = res.order_ids.get("entry")
+            log.info(
+                "tv_entry_sent symbol=%s side=%s qty=%.8f price_hint=%.8f order_id=%s latency_ms=%s",
+                sig.symbol,
+                sig.side,
+                qty,
+                sig.entry_price,
+                order_id,
+                sig.latency_ms,
+            )
         if not res.ok:
             await self.notifier.send(
                 formatters.format_execution(
@@ -983,6 +1237,7 @@ class BotEngine:
             if not sym or sym not in self.symbols_rt:
                 return
             interval = str(k.get("i"))
+            close_ms = binance_kline_close_to_confirm_ms(int(k["T"]))
             bar = Bar(
                 open_time_ms=int(k["t"]),
                 open=float(k["o"]),
@@ -990,10 +1245,12 @@ class BotEngine:
                 low=float(k["l"]),
                 close=float(k["c"]),
                 volume=float(k["v"]),
-                close_time_ms=int(k["T"]),
+                close_time_ms=close_ms,
             )
             # keep a best-effort last price for sizing / external triggers
-            self.symbols_rt[sym].last_price = bar.close
+            rt = self.symbols_rt[sym]
+            rt.last_price = bar.close
+            rt.last_kline_close_ms = close_ms
             if interval == self.timeframe:
                 await self._on_bar_close(sym, bar)
             elif interval == self.symbol_cfgs[sym].stop_engine_params.htf_interval:
@@ -1009,6 +1266,13 @@ class BotEngine:
             price = float(data.get("p"))
             rt = self.symbols_rt[sym]
             rt.last_price = price
+
+            # Signed delta 1m bars for CVD pressure filter
+            if rt.delta_store is not None:
+                try:
+                    rt.delta_store.update_trade(ts_ms=ts, qty=qty, is_buyer_maker=is_buyer_maker)
+                except Exception as ex:
+                    log.warning("delta_store_update_failed %s %s", sym, ex)
             if self.executor:
                 await self.executor.on_trade_tick(sym, price, ts)
             if rt.cfg.stop_engine_params.enabled and rt.stop_state:
@@ -1135,6 +1399,22 @@ class BotEngine:
         rt.position_qty = fill.qty
         rt.pending_signal = None
         self._positions_total += 1
+        if self.executor:
+            try:
+                await self.executor.cancel_protection(sig.symbol)
+            except Exception as e:
+                log.warning("cancel_protection_before_stop_failed %s: %s", sig.symbol, e)
+        rt.stop_order_id = None
+        rt.tp_order_id = None
+        log.info(
+            "execution_fill_received symbol=%s side=%s qty=%.8f price=%.8f source=%s latency_ms=%s",
+            sig.symbol,
+            sig.side,
+            fill.qty,
+            fill.price,
+            getattr(sig, "source", "BOT"),
+            sig.latency_ms,
+        )
 
         stop_info: Dict[str, Any] = {
             "enabled": scfg.stop_engine_params.enabled,
@@ -1182,6 +1462,14 @@ class BotEngine:
                     )
                     stop_info.update({"sl": sl0_q, "sl0": sl0_q, "R": R, "atr": rt.h1_atr_value})
                     rt.last_stop_replace_ms = int(time.time() * 1000)
+                    log.info(
+                        "protection_stop_set symbol=%s side=%s sl=%.8f order_id=%s source=%s",
+                        sig.symbol,
+                        sig.side,
+                        sl0_q,
+                        rt.stop_order_id,
+                        getattr(sig, "source", "BOT"),
+                    )
                 else:
                     msg = stop_res.msg if stop_res else "stop_failed"
                     await self._handle_stop_failure(sig, fill, scfg, stop_info, msg)
@@ -1200,6 +1488,14 @@ class BotEngine:
                     tp = tp_px
                     if tp_res.order_ids:
                         rt.tp_order_id = tp_res.order_ids.get("tp", rt.tp_order_id)
+                    log.info(
+                        "protection_tp_set symbol=%s side=%s tp=%.8f order_id=%s source=%s",
+                        sig.symbol,
+                        sig.side,
+                        tp_px,
+                        rt.tp_order_id,
+                        getattr(sig, "source", "BOT"),
+                    )
             except Exception as e:
                 log.warning("TP placement failed for %s: %s", sig.symbol, e)
             stop_info.update({"tp": tp or tp_target})
@@ -1218,6 +1514,14 @@ class BotEngine:
         })
 
         stop_info.setdefault("atr", rt.h1_atr_value)
+        extra_lines = None
+        if str(getattr(sig, "source", "")).startswith("TV"):
+            try:
+                confirm_utc = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(sig.confirm_time_ms / 1000))
+            except Exception:
+                confirm_utc = str(sig.confirm_time_ms)
+            latency_val = sig.latency_ms if sig.latency_ms is not None else "n/a"
+            extra_lines = [f"TV -> EXEC parity=OptionA | confirm={confirm_utc} | latency_ms={latency_val}"]
 
         await self.notifier.send(
             formatters.format_execution(
@@ -1230,6 +1534,7 @@ class BotEngine:
                 stop_info=stop_info,
                 exec_mode=self.exec_mode,
                 fill=fill,
+                extra_lines=extra_lines,
             )
         )
 
@@ -1259,6 +1564,7 @@ class BotEngine:
 
     async def _on_bar_close(self, symbol: str, bar: Bar, heal_gaps: bool = True, emit_alerts: bool = True) -> None:
         rt = self.symbols_rt[symbol]
+        rt.last_kline_close_ms = bar.close_time_ms
         if heal_gaps:
             await self._heal_if_gap(symbol, rt, bar, emit_alerts)
         rt.last_bar_open_ms = bar.open_time_ms
@@ -1299,6 +1605,14 @@ class BotEngine:
             return
         if direction == "short_only" and sig.side == "LONG":
             self._log_signal_suppressed(sig, "direction_filter", {"direction": direction})
+            return
+
+        # CVD pressure confirmation gate (signed delta over last N minutes)
+        cvd_ok, cvd_diag = self._eval_cvd_pressure(symbol, rt, sig.side, sig.confirm_time_ms, source="BOT")
+        if not cvd_ok:
+            self._log_signal_suppressed(sig, "cvd_pressure_filter", cvd_diag)
+            # mark idempotency to avoid repeated processing of the same bar
+            self._sent_alert_keys.add(key)
             return
 
         now_ms = int(time.time() * 1000)
@@ -1345,6 +1659,17 @@ class BotEngine:
             "be_trigger_r": scfg.stop_engine_params.be_trigger_r,
             "be_buffer_bps": scfg.stop_engine_params.be_buffer_bps,
         }
+        # Attach CVD diagnostics for observability
+        if cvd_diag:
+            stop_preview.update({
+                "cvd_filter": cvd_diag.get("cvd_filter"),
+                "delta_window_m": cvd_diag.get("delta_window_m"),
+                "delta_sum": cvd_diag.get("delta_sum"),
+                "signed_delta": cvd_diag.get("signed_delta"),
+                "signed_delta_threshold": cvd_diag.get("signed_delta_threshold"),
+                "cvd_pass": cvd_diag.get("pass"),
+                "cvd_ok": cvd_diag.get("ok"),
+            })
 
         orders_cfg = scfg.orders_cfg
         notional = float(orders_cfg.get("notional_usdt", 25.0))

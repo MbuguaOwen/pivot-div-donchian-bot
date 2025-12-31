@@ -29,6 +29,8 @@ class Signal:
     cvd_div: bool
     pivot_time_ms: int
     confirm_time_ms: int
+    source: str = "BOT"
+    latency_ms: Optional[int] = None
 
 @dataclass
 class RiskLevels:

@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 import aiohttp
 
 from ..models import Bar
+from ..time_utils import binance_kline_close_to_confirm_ms
 
 log = logging.getLogger("binance.rest")
 
@@ -255,7 +256,7 @@ class BinanceRest:
                 low=float(row[3]),
                 close=float(row[4]),
                 volume=float(row[5]),
-                close_time_ms=int(row[6]),
+                close_time_ms=binance_kline_close_to_confirm_ms(int(row[6])),
             ))
         return bars
 
