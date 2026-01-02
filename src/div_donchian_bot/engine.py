@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import math
 import logging
 import time
@@ -63,6 +64,25 @@ def _tf_to_minutes(tf: str) -> int:
         return int(tf[:-1]) * 60
     raise ValueError(f"Unsupported timeframe: {tf}")
 
+def _parse_hhmm(val: Any) -> int:
+    try:
+        s = str(val).strip()
+        if not s:
+            return 0
+        parts = s.split(":")
+        if len(parts) != 2:
+            return 0
+        h = int(parts[0])
+        m = int(parts[1])
+        if h == 24 and m == 0:
+            return 24 * 60
+        if not (0 <= h < 24 and 0 <= m < 60):
+            return 0
+        return h * 60 + m
+    except Exception:
+        log.warning("invalid_hhmm_value value=%s", val)
+        return 0
+
 @dataclass
 class SymbolConfig:
     symbol: str
@@ -100,6 +120,43 @@ class ParityConfig:
     gap_heal: bool = True
     desync_pause: bool = True
 
+def _format_offset(minutes: int) -> str:
+    sign = "+" if minutes >= 0 else "-"
+    total = abs(minutes)
+    return f"{sign}{total // 60:02d}:{total % 60:02d}"
+
+@dataclass
+class TradingWindowConfig:
+    enabled: bool = False
+    start_minutes: int = 0
+    end_minutes: int = 24 * 60
+    tz_offset_minutes: int = 0
+    label: str = "UTC"
+
+    @classmethod
+    def from_dict(cls, cfg: Dict[str, Any]) -> "TradingWindowConfig":
+        enabled = bool(cfg.get("enabled", False))
+        start = _parse_hhmm(cfg.get("start_local", cfg.get("start", "10:00")))
+        end = _parse_hhmm(cfg.get("end_local", cfg.get("end", "00:00")))
+        try:
+            tz_hours = float(cfg.get("tz_offset_hours", cfg.get("utc_offset_hours", 0)))
+            tz_offset_minutes = int(tz_hours * 60)
+        except Exception:
+            tz_offset_minutes = 0
+        label = str(cfg.get("label") or cfg.get("tz_label") or cfg.get("timezone") or f"UTC{_format_offset(tz_offset_minutes)}")
+        return cls(enabled=enabled, start_minutes=start, end_minutes=end, tz_offset_minutes=tz_offset_minutes, label=label)
+
+    @staticmethod
+    def _fmt(mins: int) -> str:
+        if mins >= 24 * 60:
+            return "24:00"
+        h = (mins // 60) % 24
+        m = mins % 60
+        return f"{h:02d}:{m:02d}"
+
+    def describe(self) -> str:
+        return f"{self.label} {self._fmt(self.start_minutes)}-{self._fmt(self.end_minutes)} (UTC{_format_offset(self.tz_offset_minutes)})"
+
 @dataclass
 class SymbolRuntime:
     cfg: SymbolConfig
@@ -131,12 +188,14 @@ class BotEngine:
         load_dotenv()
 
         self.cfg = cfg
+        run_cfg = cfg.get("run", {}) or {}
         self.config_dir = Path(cfg.get("_config_dir", "."))
         exec_cfg = cfg.get("execution", {}) or {}
         self.exec_mode = str(exec_cfg.get("mode", "binance")).lower()
         self.paper_cfg = exec_cfg.get("paper", {}) or {}
-        self.mode = cfg["run"]["mode"]
-        self.timeframe = cfg["run"].get("timeframe", "15m")
+        self.mode = str(run_cfg.get("mode", "live")).lower()
+        self.timeframe = run_cfg.get("timeframe", "15m")
+        self.trading_window = TradingWindowConfig.from_dict(run_cfg.get("trading_window", {}))
         self.enable_telegram = bool(cfg.get("telegram", {}).get("enabled", True))
         ex_cfg = cfg.get("exchange", {}) or {}
         self.testnet = bool(ex_cfg.get("testnet", True))
@@ -144,7 +203,7 @@ class BotEngine:
         tg_cfg = cfg.get("telegram", {}) or {}
         self.parse_mode = tg_cfg.get("parse_mode", "HTML")
         self.branding = tg_cfg.get("branding", "Pivot Div + Donchian")
-        self.heartbeat_sec = int(tg_cfg.get("heartbeat_seconds", cfg["run"].get("heartbeat_seconds", 30)))
+        self.heartbeat_sec = int(tg_cfg.get("heartbeat_seconds", run_cfg.get("heartbeat_seconds", 30)))
         self.heartbeat_enabled = bool(tg_cfg.get("heartbeat_enabled", True))
         self.pair_overrides_dir = (cfg.get("universe", {}) or {}).get("pair_overrides_dir", "configs/pairs")
         strat_cfg = cfg.get("strategy", {}) or {}
@@ -799,6 +858,24 @@ class BotEngine:
             source="TV",
         )
 
+    def _within_trading_window(self, ts_ms: int) -> tuple[bool, Optional[str]]:
+        tw = self.trading_window
+        if not tw.enabled:
+            return True, None
+        try:
+            utc_dt = dt.datetime.utcfromtimestamp(ts_ms / 1000)
+            local_dt = utc_dt + dt.timedelta(minutes=tw.tz_offset_minutes)
+            local_minutes = local_dt.hour * 60 + local_dt.minute
+        except Exception as e:
+            log.warning("trading_window_time_parse_failed ts_ms=%s err=%s", ts_ms, e)
+            return True, None
+        if tw.end_minutes <= tw.start_minutes:
+            in_window = local_minutes >= tw.start_minutes or local_minutes < tw.end_minutes
+        else:
+            in_window = tw.start_minutes <= local_minutes < tw.end_minutes
+        local_label = f"{local_dt.strftime('%Y-%m-%d %H:%M')} {tw.label} (UTC{_format_offset(tw.tz_offset_minutes)})"
+        return in_window, local_label
+
     async def _on_tv_signal(self, tv: TvSignal) -> None:
         """Handle an incoming TradingView webhook.
 
@@ -978,6 +1055,11 @@ class BotEngine:
         key = self._signal_key(sig)
         if key in self._sent_alert_keys:
             self._log_signal_suppressed(sig, "duplicate", {"idempotency_key": key, "source": source})
+            return
+
+        in_window, local_label = self._within_trading_window(sig.confirm_time_ms)
+        if not in_window:
+            self._log_signal_suppressed(sig, "trading_window_closed", {"window": self.trading_window.describe(), "local_time": local_label, "source": source})
             return
 
         # Direction filter
@@ -1596,6 +1678,11 @@ class BotEngine:
         key = self._signal_key(sig)
         if key in self._sent_alert_keys:
             self._log_signal_suppressed(sig, "duplicate", {"idempotency_key": key})
+            return
+
+        in_window, local_label = self._within_trading_window(sig.confirm_time_ms)
+        if not in_window:
+            self._log_signal_suppressed(sig, "trading_window_closed", {"window": self.trading_window.describe(), "local_time": local_label})
             return
 
         # Direction filter

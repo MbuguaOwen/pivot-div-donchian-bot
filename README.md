@@ -41,6 +41,19 @@ run:
 ```
 Then run the same command.
 
+### Trading window (London + New York overlap)
+To trade only during 10:00-24:00 Nairobi time (UTC+3), use the toggle under `run.trading_window`:
+```yaml
+run:
+  trading_window:
+    enabled: true
+    start_local: "10:00"
+    end_local: "00:00"     # midnight
+    tz_offset_hours: 3     # Nairobi (UTC+3)
+    label: "Nairobi"
+```
+Set `enabled: false` to allow 24/7 trading or adjust the hours/offset to your preference.
+
 ## Running live on a VM (testnet=false)
 - Set `run.mode: live` (default is live in this repo) and `exchange.testnet: false`.
 - Populate `.env` with real Binance keys and Telegram bot/chat IDs if alerts are enabled.

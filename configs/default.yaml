@@ -1,6 +1,12 @@
 run:
   mode: live         # paper | live
   timeframe: "15m"
+  trading_window:
+    enabled: true              # block trades outside this window (uses local tz below)
+    start_local: "9:00"       # London+NY overlap start in Nairobi time
+    end_local: "01:00"         # midnight (next day) in Nairobi time
+    tz_offset_hours: 3         # Nairobi = UTC+3
+    label: "Nairobi"
 
 exchange:
   market_type: futures # futures | spot
