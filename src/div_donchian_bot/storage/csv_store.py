@@ -51,6 +51,14 @@ class CsvStore:
                 ])
                 w.writeheader()
 
+        self.kill_switch_csv = self.out / "kill_switches.csv"
+        if not self.kill_switch_csv.exists():
+            with self.kill_switch_csv.open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=[
+                    "ts_ms","symbol","side","confirm_time_ms","mode","passed","hit_rules","missing_features","don_width_atr","liq_pct_15m","liq_z_15m","hour_utc"
+                ])
+                w.writeheader()
+
     def log_event(self, d: Dict[str, Any]) -> None:
         with self.events_csv.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
@@ -83,5 +91,12 @@ class CsvStore:
         with self.cvd_filter_csv.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=[
                 "ts_ms","symbol","side","confirm_time_ms","end_ms","delta_window_m","delta_sum","signed_delta","thresh","pass","ok","reason","align","gaps","mode","source"
+            ])
+            w.writerow(d)
+
+    def log_kill_switch(self, d: Dict[str, Any]) -> None:
+        with self.kill_switch_csv.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "ts_ms","symbol","side","confirm_time_ms","mode","passed","hit_rules","missing_features","don_width_atr","liq_pct_15m","liq_z_15m","hour_utc"
             ])
             w.writerow(d)

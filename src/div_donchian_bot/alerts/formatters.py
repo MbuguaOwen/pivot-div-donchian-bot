@@ -104,6 +104,7 @@ def format_entry(
     one_pos_per_symbol: bool,
     notional_usdt: Any,
     planned_qty: Optional[float] = None,
+    kill_note: Optional[str] = None,
 ) -> str:
     header = f"<b>{ICON} TRADE SIGNAL - ENTRY</b>"
     net_label = "Testnet" if testnet else "Mainnet"
@@ -152,7 +153,12 @@ def format_entry(
     ctrls = _pre([
         f"Cooldown: {cooldown_minutes}m | MaxPos: {max_positions_total} | OnePos/Symbol: {one_pos_per_symbol}",
     ])
-    return _truncate("\n".join([header, ctx, "<b>Signal</b>", sig_block, "<b>Risk</b>", risk_block, "<b>Execution</b>", exec_block, "<b>Controls</b>", ctrls, _footer(branding)]))
+    parts = [header, ctx, "<b>Signal</b>", sig_block, "<b>Risk</b>", risk_block, "<b>Execution</b>", exec_block, "<b>Controls</b>", ctrls]
+    if kill_note:
+        parts.append("<b>Kill Switch</b>")
+        parts.append(_pre([kill_note]))
+    parts.append(_footer(branding))
+    return _truncate("\n".join(parts))
 
 
 def format_execution(
@@ -210,3 +216,26 @@ def format_error(branding: str, context: str, exc: Exception) -> str:
         f"Error:   {escape(exc)}",
     ])
     return _truncate("\n".join([header, ctx, _footer(branding)]))
+
+
+def format_kill_switch_veto(
+    branding: str,
+    symbol: str,
+    side: str,
+    confirm_time_ms: int,
+    hit_rules: List[str],
+    features: Dict[str, Any],
+) -> str:
+    header = f"<b>{ICON} KILL SWITCH VETO</b>"
+    rules = ", ".join(hit_rules) if hit_rules else "n/a"
+    feat_lines = [
+        f"don_width_atr: {features.get('don_width_atr', 'n/a')}",
+        f"liq_pct_15m: {features.get('liq_pct_15m', 'n/a')}",
+        f"liq_z_15m: {features.get('liq_z_15m', 'n/a')}",
+        f"hour_utc: {features.get('hour_utc', 'n/a')}",
+    ]
+    block = _pre([
+        f"SYM: {escape(symbol)} | SIDE: {escape(side)} | TIME: {_ts_utc(confirm_time_ms)}",
+        f"Rules hit: {escape(rules)}",
+    ] + feat_lines)
+    return _truncate("\n".join([header, block, _footer(branding)]))

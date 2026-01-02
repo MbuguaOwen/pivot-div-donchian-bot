@@ -5,7 +5,7 @@ import datetime as dt
 import math
 import logging
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Deque
@@ -37,6 +37,7 @@ from .direction import DirectionGate
 from .telegram_controls import TelegramControls, control_keyboard
 from .tv_bridge import TvBridgeConfig, TvWebhookServer, TvSignal
 from .orderflow.delta_store import Delta1mStore
+from .filters.kill_switches import KillSwitchConfig, KillDecision, parse_kill_switches, evaluate_kill_switch
 from .time_utils import canonical_close_ms, binance_kline_close_to_confirm_ms
 
 log = logging.getLogger("engine")
@@ -83,6 +84,25 @@ def _parse_hhmm(val: Any) -> int:
         log.warning("invalid_hhmm_value value=%s", val)
         return 0
 
+
+def _percentile_rank(values: List[float], x: float) -> float:
+    if not values:
+        return float("nan")
+    n = len(values)
+    count = sum(1 for v in values if v <= x)
+    return count / n if n > 0 else float("nan")
+
+
+def _zscore(values: List[float], x: float) -> float:
+    if not values:
+        return float("nan")
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / len(values)
+    std = math.sqrt(var)
+    if std <= 0:
+        return float("nan")
+    return (x - mean) / std
+
 @dataclass
 class SymbolConfig:
     symbol: str
@@ -95,6 +115,8 @@ class SymbolConfig:
     position_cfg: Dict[str, Any]
     divergence_mode: str
     parity: ParityConfig
+    kill_switches: KillSwitchConfig
+    kill_switch_needs_orderflow: bool
 
 
 @dataclass
@@ -181,7 +203,13 @@ class SymbolRuntime:
     desynced: bool = False
     desync_warned: bool = False
     delta_store: Optional[Delta1mStore] = None
-    delta_store: Optional[Delta1mStore] = None
+    atr15: Optional[AtrState] = None
+    atr15_value: Optional[float] = None
+    liq_window: Optional[Deque[float]] = None
+    kill_features_cache: Optional[OrderedDict[int, Dict[str, Any]]] = None
+    last_liq_pct_15m: Optional[float] = None
+    last_liq_z_15m: Optional[float] = None
+    last_don_width_atr: Optional[float] = None
 
 class BotEngine:
     def __init__(self, cfg: Dict[str, Any]):
@@ -345,10 +373,18 @@ class BotEngine:
                 h1_bars = None
                 h1_atr = None
             delta_store = None
-            if scfg.cvd_pressure.enabled:
+            if scfg.cvd_pressure.enabled or scfg.kill_switch_needs_orderflow:
                 # Keep enough minutes for warmup + window + small safety.
                 max_minutes = max(120, scfg.cvd_pressure.warmup_minutes + scfg.cvd_pressure.delta_window_minutes + 10)
                 delta_store = Delta1mStore(max_minutes=max_minutes)
+
+            ks_feat_cfg = scfg.kill_switches.feature_config if scfg.kill_switches else {}
+            atr_len_15m = int(ks_feat_cfg.get("atr_len_15m", 24))
+            liq_lookback = int(ks_feat_cfg.get("liq_lookback_bars", 240))
+            cache_size = max(10, int(ks_feat_cfg.get("cache_size", 50)))
+            atr15_state = AtrState(atr_len_15m, ema_seed_mode=self.parity_cfg.ema_seed_mode if self.parity_cfg.mode else "first") if scfg.kill_switches.enabled else None
+            liq_window = deque(maxlen=liq_lookback) if scfg.kill_switches.enabled else None
+            kill_cache: Optional[OrderedDict[int, Dict[str, Any]]] = OrderedDict() if scfg.kill_switches.enabled else None
 
             self.symbols_rt[sym] = SymbolRuntime(
                 cfg=scfg,
@@ -356,6 +392,9 @@ class BotEngine:
                 h1_atr=h1_atr,
                 h1_bars=h1_bars,
                 delta_store=delta_store,
+                atr15=atr15_state,
+                liq_window=liq_window,
+                kill_features_cache=kill_cache,
             )
 
         for sym in symbols:
@@ -398,6 +437,7 @@ class BotEngine:
             if (
                 self.symbol_cfgs[s].enable_cvd
                 or self.symbol_cfgs[s].cvd_pressure.enabled
+                or self.symbol_cfgs[s].kill_switch_needs_orderflow
                 or self.symbol_cfgs[s].stop_engine_params.enabled
                 or self.exec_mode == "paper"
             )
@@ -487,6 +527,21 @@ class BotEngine:
             warmup_minutes=int(cvd_cfg.get("warmup_minutes", 60)),
         )
 
+        ks_cfg = parse_kill_switches(s_cfg.get("kill_switches", {}))
+
+        def _needs_orderflow() -> bool:
+            if not ks_cfg.enabled:
+                return False
+            prefixes = ("quote_vol_", "quote_delta_", "signed_delta_", "qdr_")
+            for rule in ks_cfg.rules:
+                for cond in list(rule.all) + list(rule.any):
+                    fname = cond.feature or ""
+                    if any(fname.startswith(p) for p in prefixes):
+                        return True
+            return False
+
+        kill_switch_needs_orderflow = _needs_orderflow()
+
         # risk.engine config block
         risk_cfg = merged.get("risk", {}).get("engine", {}) or {}
         trailing_cfg = risk_cfg.get("trailing", {}) or {}
@@ -526,6 +581,8 @@ class BotEngine:
             position_cfg=position_cfg,
             divergence_mode=divergence_mode,
             parity=self.parity_cfg,
+            kill_switches=ks_cfg,
+            kill_switch_needs_orderflow=kill_switch_needs_orderflow,
         )
 
     def _suggest_warmup(self, params: StrategyParams) -> int:
@@ -751,6 +808,181 @@ class BotEngine:
             return bool(passed), diag
 
         return True, diag
+
+    def _parse_window_from_name(self, name: str, prefix: str) -> Optional[int]:
+        if not name.startswith(prefix):
+            return None
+        tail = name[len(prefix):]
+        if tail.endswith("m"):
+            tail = tail[:-1]
+        try:
+            return int(tail)
+        except Exception:
+            return None
+
+    def _compute_kill_orderflow_feature(self, fname: str, rt: SymbolRuntime, end_ms: int) -> Optional[float]:
+        if rt.delta_store is None:
+            return None
+        if end_ms % 60_000 != 59_999:
+            return None
+        if fname.startswith("signed_delta_"):
+            window = self._parse_window_from_name(fname, "signed_delta_")
+            if window is None:
+                return None
+            res = rt.delta_store.get_delta_sum(end_ms=end_ms, window_minutes=window, warmup_minutes=0)
+            return res.delta_sum if res.ok else None
+        if fname.startswith("quote_vol_"):
+            window = self._parse_window_from_name(fname, "quote_vol_")
+            if window is None:
+                return None
+            res = rt.delta_store.get_quote_sum(end_ms=end_ms, window_minutes=window, warmup_minutes=0)
+            return res.delta_sum if res.ok else None
+        if fname.startswith("quote_delta_"):
+            window = self._parse_window_from_name(fname, "quote_delta_")
+            if window is None:
+                return None
+            res = rt.delta_store.get_quote_delta_sum(end_ms=end_ms, window_minutes=window, warmup_minutes=0)
+            return res.delta_sum if res.ok else None
+        if fname.startswith("qdr_"):
+            window = self._parse_window_from_name(fname, "qdr_")
+            if window is None:
+                return None
+            res = rt.delta_store.get_quote_delta_ratio(end_ms=end_ms, window_minutes=window, warmup_minutes=0)
+            return res.delta_sum if res.ok else None
+        return None
+
+    def _update_kill_features(self, symbol: str, rt: SymbolRuntime, bar: Bar) -> Dict[str, Any]:
+        cfg = rt.cfg.kill_switches
+        if not cfg.enabled or rt.strat is None:
+            return {}
+
+        feats: Dict[str, Any] = {}
+        # ATR 15m
+        if rt.atr15:
+            rt.atr15_value = rt.atr15.update(bar.high, bar.low, bar.close)
+
+        # Donchian width / ATR
+        try:
+            don_hi = rt.strat.don_hi[-1] if rt.strat.don_hi else None
+            don_lo = rt.strat.don_lo[-1] if rt.strat.don_lo else None
+        except Exception:
+            don_hi = don_lo = None
+        don_width = None
+        don_width_atr = None
+        if don_hi is not None and don_lo is not None:
+            don_width = don_hi - don_lo
+        if don_width is not None and rt.atr15_value:
+            if rt.atr15_value != 0:
+                don_width_atr = don_width / rt.atr15_value
+        rt.last_don_width_atr = don_width_atr
+
+        # Liquidity proxy and percentile/z-score
+        liq_val = float(bar.close * bar.volume)
+        liq_pct = float("nan")
+        liq_z = float("nan")
+        if rt.liq_window is not None:
+            rt.liq_window.append(liq_val)
+            vals_list = list(rt.liq_window)
+            min_samples = int(cfg.feature_config.get("liq_min_samples", 30))
+            if len(vals_list) >= max(1, min_samples):
+                liq_pct = _percentile_rank(vals_list, liq_val)
+                liq_z = _zscore(vals_list, liq_val)
+        if math.isnan(liq_pct):
+            liq_pct = None
+        if math.isnan(liq_z):
+            liq_z = None
+        rt.last_liq_pct_15m = liq_pct
+        rt.last_liq_z_15m = liq_z
+
+        try:
+            dt_utc = dt.datetime.utcfromtimestamp(bar.close_time_ms / 1000.0)
+            hour_utc = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
+        except Exception:
+            hour_utc = None
+
+        feats.update({
+            "don_width_atr": don_width_atr,
+            "liq_pct_15m": liq_pct,
+            "liq_z_15m": liq_z,
+            "hour_utc": hour_utc,
+        })
+
+        if rt.kill_features_cache is not None:
+            rt.kill_features_cache[bar.close_time_ms] = feats
+            cache_size = max(10, int(cfg.feature_config.get("cache_size", 50)))
+            while len(rt.kill_features_cache) > cache_size:
+                rt.kill_features_cache.popitem(last=False)
+        return feats
+
+    def _get_kill_features(self, rt: SymbolRuntime, confirm_time_ms: int) -> Dict[str, Any]:
+        cfg = rt.cfg.kill_switches
+        if not cfg.enabled:
+            return {}
+        feats: Dict[str, Any] = {}
+        if rt.kill_features_cache and confirm_time_ms in rt.kill_features_cache:
+            feats.update(rt.kill_features_cache.get(confirm_time_ms, {}))
+        else:
+            feats.update({
+                "don_width_atr": rt.last_don_width_atr,
+                "liq_pct_15m": rt.last_liq_pct_15m,
+                "liq_z_15m": rt.last_liq_z_15m,
+            })
+            try:
+                dt_utc = dt.datetime.utcfromtimestamp(confirm_time_ms / 1000.0)
+                feats["hour_utc"] = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
+            except Exception:
+                feats["hour_utc"] = None
+        return feats
+
+    def _apply_kill_switches(self, symbol: str, rt: SymbolRuntime, sig: Signal, source: str = "bot") -> tuple[bool, KillDecision, Dict[str, Any]]:
+        cfg = rt.cfg.kill_switches
+        if not cfg.enabled or cfg.mode == "off":
+            dec = KillDecision(passed=True, hit_rules=[], missing_features=[], features_used={}, mode=cfg.mode)
+            return True, dec, {}
+
+        features = self._get_kill_features(rt, sig.confirm_time_ms)
+        required: set[str] = set()
+        for rule in cfg.rules:
+            if rule.side not in ("BOTH", sig.side):
+                continue
+            for cond in list(rule.all) + list(rule.any):
+                if cond.feature:
+                    required.add(cond.feature)
+
+        end_ms, align_reason = self._align_confirm_ms_for_delta(sig.confirm_time_ms)
+        if cfg.enabled and rt.cfg.kill_switch_needs_orderflow and align_reason != "unaligned":
+            for fname in required:
+                if features.get(fname) is not None:
+                    continue
+                val = self._compute_kill_orderflow_feature(fname, rt, end_ms)
+                if val is not None:
+                    features[fname] = val
+
+        decision = evaluate_kill_switch(sig, features, cfg)
+        log.info(
+            "kill_switch_eval symbol=%s side=%s passed=%s hit=%s missing=%s feats=%s mode=%s source=%s",
+            symbol, sig.side, decision.passed, decision.hit_rules, decision.missing_features, decision.features_used, cfg.mode, source,
+        )
+        try:
+            self.store.log_kill_switch({
+                "ts_ms": int(time.time() * 1000),
+                "symbol": symbol,
+                "side": sig.side,
+                "confirm_time_ms": sig.confirm_time_ms,
+                "mode": cfg.mode,
+                "passed": int(decision.passed),
+                "hit_rules": ",".join(decision.hit_rules),
+                "missing_features": ",".join(decision.missing_features),
+                "don_width_atr": features.get("don_width_atr"),
+                "liq_pct_15m": features.get("liq_pct_15m"),
+                "liq_z_15m": features.get("liq_z_15m"),
+                "hour_utc": features.get("hour_utc"),
+            })
+        except Exception:
+            log.exception("kill_switch_csv_write_failed")
+
+        allowed = decision.passed or cfg.mode == "shadow"
+        return allowed, decision, features
 
     async def _maybe_healthcheck(self, now_ms: int) -> None:
         if not self.health_enabled or not self.health_url:
@@ -1071,6 +1303,34 @@ class BotEngine:
             self._log_signal_suppressed(sig, "direction_filter", {"direction": direction, "source": source})
             return
 
+        ks_decision: Optional[KillDecision] = None
+        ks_features: Dict[str, Any] = {}
+        kill_note: Optional[str] = None
+        try:
+            allowed, ks_decision, ks_features = self._apply_kill_switches(sig.symbol, rt, sig, source=source)
+        except Exception as e:
+            allowed = True
+            log.warning("kill_switch_apply_failed %s %s", sig.symbol, e)
+        if ks_decision and not ks_decision.passed and rt.cfg.kill_switches.mode == "shadow":
+            kill_note = f"KILL-SWITCH SHADOW hit: {','.join(ks_decision.hit_rules)}"
+        if not allowed:
+            self._log_signal_suppressed(sig, "kill_switch", {"rules": ks_decision.hit_rules if ks_decision else [], "source": source})
+            self._sent_alert_keys.add(key)
+            try:
+                await self.notifier.send(
+                    formatters.format_kill_switch_veto(
+                        branding=self.branding,
+                        symbol=sig.symbol,
+                        side=sig.side,
+                        confirm_time_ms=sig.confirm_time_ms,
+                        hit_rules=ks_decision.hit_rules if ks_decision else [],
+                        features=ks_features,
+                    )
+                )
+            except Exception:
+                log.exception("kill_switch_veto_notify_failed")
+            return
+
         # CVD pressure confirmation gate for TV-driven trades as well
         cvd_ok, cvd_diag = self._eval_cvd_pressure(sig.symbol, rt, sig.side, sig.confirm_time_ms, source=source)
         if not cvd_ok:
@@ -1110,7 +1370,6 @@ class BotEngine:
                 "signed_delta_threshold": cvd_diag.get("signed_delta_threshold"),
                 "cvd_ok": cvd_diag.get("ok"),
             })
-
         orders_cfg = scfg.orders_cfg
         notional = float(orders_cfg.get("notional_usdt", 25.0))
         planned_qty = None
@@ -1161,6 +1420,7 @@ class BotEngine:
                 one_pos_per_symbol=scfg.position_cfg.get("one_position_per_symbol", True),
                 notional_usdt=notional,
                 planned_qty=planned_qty,
+                kill_note=kill_note,
             )
         )
 
@@ -1352,7 +1612,7 @@ class BotEngine:
             # Signed delta 1m bars for CVD pressure filter
             if rt.delta_store is not None:
                 try:
-                    rt.delta_store.update_trade(ts_ms=ts, qty=qty, is_buyer_maker=is_buyer_maker)
+                    rt.delta_store.update_trade(ts_ms=ts, qty=qty, is_buyer_maker=is_buyer_maker, price=price)
                 except Exception as ex:
                     log.warning("delta_store_update_failed %s %s", sym, ex)
             if self.executor:
@@ -1660,6 +1920,7 @@ class BotEngine:
         await self._maybe_update_stop(symbol, reason="BAR_CLOSE")
 
         sig = rt.strat.on_bar_close(bar)
+        self._update_kill_features(symbol, rt, bar)
         if not sig:
             return
 
@@ -1692,6 +1953,34 @@ class BotEngine:
             return
         if direction == "short_only" and sig.side == "LONG":
             self._log_signal_suppressed(sig, "direction_filter", {"direction": direction})
+            return
+
+        ks_decision: Optional[KillDecision] = None
+        ks_features: Dict[str, Any] = {}
+        kill_note: Optional[str] = None
+        try:
+            allowed, ks_decision, ks_features = self._apply_kill_switches(symbol, rt, sig, source="bot")
+        except Exception as e:
+            allowed = True
+            log.warning("kill_switch_apply_failed %s %s", symbol, e)
+        if ks_decision and not ks_decision.passed and rt.cfg.kill_switches.mode == "shadow":
+            kill_note = f"KILL-SWITCH SHADOW hit: {','.join(ks_decision.hit_rules)}"
+        if not allowed:
+            self._log_signal_suppressed(sig, "kill_switch", {"rules": ks_decision.hit_rules if ks_decision else []})
+            self._sent_alert_keys.add(key)
+            try:
+                await self.notifier.send(
+                    formatters.format_kill_switch_veto(
+                        branding=self.branding,
+                        symbol=sig.symbol,
+                        side=sig.side,
+                        confirm_time_ms=sig.confirm_time_ms,
+                        hit_rules=ks_decision.hit_rules if ks_decision else [],
+                        features=ks_features,
+                    )
+                )
+            except Exception:
+                log.exception("kill_switch_veto_notify_failed")
             return
 
         # CVD pressure confirmation gate (signed delta over last N minutes)
@@ -1808,6 +2097,7 @@ class BotEngine:
                 one_pos_per_symbol=scfg.position_cfg.get("one_position_per_symbol", True),
                 notional_usdt=notional,
                 planned_qty=planned_qty,
+                kill_note=kill_note,
             )
         )
 

@@ -67,6 +67,28 @@ strategy:
     # either: pine OR cvd divergence
     mode: "pine"
   fire_on_close_only: true
+  kill_switches:
+    enabled: true
+    mode: filter           # off | shadow | filter
+    missing_policy: pass   # pass | fail
+    feature_config:
+      atr_len_15m: 24
+      liq_lookback_bars: 240
+      liq_min_samples: 30
+      cache_size: 50
+    rules:
+      - name: short_too_wide_don
+        side: SHORT
+        all:
+          - feature: don_width_atr
+            op: ">"
+            value: 16.7
+      - name: long_thin_liquidity
+        side: LONG
+        all:
+          - feature: liq_pct_15m
+            op: "<="
+            value: 0.40
 
 parity:
   mode: true
@@ -92,7 +114,7 @@ risk:
     k_init: 15.8             # cap = 1.8 * ATR(1h,24)
 
     # 3) Fixed RR take-profit
-    tp_r_mult: 2.0          # TP = 2R
+    tp_r_mult: 200.0          # TP = 2R
 
     # 4) Break-even
     be_trigger_r: 1.0
@@ -100,10 +122,10 @@ risk:
 
     # 5) Optional trailing (OFF by default)
     trailing:
-      enabled: false
-      trigger_r: 2.5
-      k_trail: 1.6
-      lock_r: 1.0
+      enabled: true
+      trigger_r: 2.0
+      k_trail: 15.6
+      lock_r: 0.5
 
     min_stop_replace_interval_sec: 2
     min_stop_tick_improvement: 2

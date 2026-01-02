@@ -107,6 +107,43 @@ Every candidate entry (BOT or TV) logs one line:
 `CVD_FILTER,side=...,symbol=...,confirm_ms=...,delta_15m=...,signed=...,thresh=...,pass=...,...`
 and a CSV is written to `artifacts/<run_id>/cvd_filter.csv` for reproducibility.
 
+## Kill switches (cross-symbol, deterministic veto)
+Kill switches gate both bot-generated and TradingView-driven signals using normalized, per-symbol features (so a single rule set works across all 20 pairs). Config (under `strategy.kill_switches`):
+```yaml
+strategy:
+  kill_switches:
+    enabled: true
+    mode: filter           # off | shadow | filter
+    missing_policy: pass   # pass | fail
+    feature_config:
+      atr_len_15m: 24
+      liq_lookback_bars: 240
+      liq_min_samples: 30
+      cache_size: 50
+    rules:
+      - name: short_too_wide_don
+        side: SHORT
+        all:
+          - feature: don_width_atr      # Donchian width / ATR(24,15m)
+            op: ">"
+            value: 16.7
+      - name: long_thin_liquidity
+        side: LONG
+        all:
+          - feature: liq_pct_15m        # percentile of 15m quote (close*vol) vs per-symbol history
+            op: "<="
+            value: 0.40
+```
+- Modes: `off` = disabled, `shadow` = log hits but never block, `filter` = deterministic veto on rule hit.
+- `missing_policy`: `pass` treats missing/NaN features as non-triggering; `fail` treats them as triggering (fail-closed).
+- Features per bar (cached per `confirm_time_ms` for TV parity): `don_width_atr`, `liq_pct_15m`, `liq_z_15m`, `hour_utc`. Liquidity uses percentile/z-score over `liq_lookback_bars` with a `liq_min_samples` warmup.
+- Logging: every eval writes `artifacts/.../kill_switches.csv` with pass/fail, hit rules, missing features, and the key feature values. Structured log line: `kill_switch_eval symbol=...`.
+- Alerts: filter-mode veto sends a Telegram "KILL SWITCH VETO" with hit rules and feature snapshot; shadow-mode hits append a note to the entry alert.
+
+Operational note (liq_pct_15m threshold tuning):
+- `thr = 0.40` had the best backtest PF (4.42) but cuts trade count further and risks BTC-only overfit until validated on all 20 pairs.
+- If going live conservatively: ✅ start with `0.35` in shadow; if multi-symbol confirms, graduate to `0.40`.
+
 ## HTF structure risk engine
 Single risk engine (no separate ATR SL/TP module). In `configs/default.yaml`:
 ```yaml

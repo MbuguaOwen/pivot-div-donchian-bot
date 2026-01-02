@@ -49,3 +49,24 @@ def test_delta_store_warmup_requirement() -> None:
     res = ds.get_delta_sum(end_ms=119_999, window_minutes=1, warmup_minutes=3)
     assert res.ok is False
     assert res.reason == "insufficient_warmup"
+
+
+def test_delta_store_quote_metrics() -> None:
+    ds = Delta1mStore(max_minutes=100)
+    # minute 0
+    ds.update_trade(ts_ms=30_000, qty=1.0, is_buyer_maker=False, price=100.0)  # +100 quote, +100 quote delta
+    # minute 1
+    ds.update_trade(ts_ms=90_000, qty=2.0, is_buyer_maker=True, price=50.0)   # +100 quote, -100 quote delta
+
+    end_ms = 119_999
+    qsum = ds.get_quote_sum(end_ms=end_ms, window_minutes=2, warmup_minutes=0)
+    assert qsum.ok
+    assert abs(qsum.delta_sum - 200.0) < 1e-9
+
+    qdelta = ds.get_quote_delta_sum(end_ms=end_ms, window_minutes=2, warmup_minutes=0)
+    assert qdelta.ok
+    assert abs(qdelta.delta_sum - 0.0) < 1e-9
+
+    ratio = ds.get_quote_delta_ratio(end_ms=end_ms, window_minutes=2, warmup_minutes=0)
+    assert ratio.ok
+    assert abs(ratio.delta_sum - 0.0) < 1e-9

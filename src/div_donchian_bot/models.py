@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Any, Dict, Optional, Literal
 
 Side = Literal["LONG", "SHORT"]
 
@@ -31,6 +31,7 @@ class Signal:
     confirm_time_ms: int
     source: str = "BOT"
     latency_ms: Optional[int] = None
+    features: Optional[Dict[str, Any]] = None
 
 @dataclass
 class RiskLevels:

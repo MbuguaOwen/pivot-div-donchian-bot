@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Optional, List, Literal
+import datetime as dt
 
 import logging
 
@@ -34,6 +35,8 @@ class SymbolStrategyState:
         self.bars: Deque[Bar] = deque(maxlen=max(2000, params.don_len + 2*params.pivot_len + 50))
         self.osc_ema = EmaState(params.osc_ema_len, seed_mode=params.ema_seed_mode)
         self.osc_vals: Deque[float] = deque(maxlen=self.bars.maxlen)
+        self.atr = AtrState(14)
+        self.atr_vals: Deque[float] = deque(maxlen=self.bars.maxlen)
 
         self.don_hi: Deque[float] = deque(maxlen=self.bars.maxlen)
         self.don_lo: Deque[float] = deque(maxlen=self.bars.maxlen)
@@ -53,6 +56,7 @@ class SymbolStrategyState:
 
         self.last_pl_cvd: Optional[float] = None
         self.last_ph_cvd: Optional[float] = None
+        self.last_signal_confirm_ms: Optional[int] = None
 
     def _log_suppressed(self, bar: Bar, reason: str, extra: Optional[dict] = None) -> None:
         if not log.isEnabledFor(logging.DEBUG):
@@ -109,6 +113,9 @@ class SymbolStrategyState:
         osc = self.osc_ema.update(pressure)
         self.osc_vals.append(osc)
 
+        atr_val = self.atr.update(bar.high, bar.low, bar.close)
+        self.atr_vals.append(atr_val)
+
         # Donchian + loc
         highs = [b.high for b in self.bars]
         lows = [b.low for b in self.bars]
@@ -143,12 +150,14 @@ class SymbolStrategyState:
         lows_list  = [b.low for b in self.bars]
         don_hi_series = list(self.don_hi)
         don_lo_series = list(self.don_lo)
+        atr_series = list(self.atr_vals)
 
         # Grab pivot bar values (equivalent to Pine: low[pivotLen], osc[pivotLen], loc[pivotLen])
         pivot_bar = list(self.bars)[mid]
         pivot_osc_pine = list(self.osc_vals)[mid]
         pivot_loc = list(self.loc)[mid]
         pivot_cvd = list(self.cvd_vals)[mid] if self.enable_cvd else float("nan")
+        pivot_atr = atr_series[mid] if mid < len(atr_series) else float("nan")
         pivot_state = {
             "symbol": self.symbol,
             "pivot_index": mid,
@@ -161,6 +170,7 @@ class SymbolStrategyState:
             "pivot_loc": pivot_loc,
             "don_hi": don_hi_series[mid] if mid < len(don_hi_series) else None,
             "don_lo": don_lo_series[mid] if mid < len(don_lo_series) else None,
+            "pivot_atr": pivot_atr if mid < len(atr_series) else None,
             "last_pl_price": self.last_pl_price,
             "last_pl_osc": self.last_pl_osc,
             "last_ph_price": self.last_ph_price,
@@ -201,6 +211,52 @@ class SymbolStrategyState:
                 return a or b
             return a
 
+        def build_features(side: str, slip: float) -> dict:
+            don_hi_val = don_hi_series[mid] if mid < len(don_hi_series) else None
+            don_lo_val = don_lo_series[mid] if mid < len(don_lo_series) else None
+            don_width = (don_hi_val - don_lo_val) if (don_hi_val is not None and don_lo_val is not None) else None
+            atr_val_mid = atr_series[mid] if mid < len(atr_series) else None
+            don_width_atr = None
+            if don_width is not None and atr_val_mid is not None and atr_val_mid != 0:
+                don_width_atr = don_width / atr_val_mid
+            prev_osc = self.last_pl_osc if side == "LONG" else self.last_ph_osc
+            osc_delta = pivot_osc_pine - prev_osc if prev_osc is not None else None
+            mins_since_prev = None
+            if self.last_signal_confirm_ms is not None:
+                mins_since_prev = (bar.close_time_ms - self.last_signal_confirm_ms) / 60000.0
+            try:
+                dt_utc = dt.datetime.utcfromtimestamp(bar.close_time_ms / 1000.0)
+                hour_utc = dt_utc.hour
+                dow = dt_utc.weekday()
+            except Exception:
+                hour_utc = None
+                dow = None
+            rng = pivot_bar.high - pivot_bar.low
+            if rng <= 0:
+                body_pct = upper_wick_pct = lower_wick_pct = close_pos = None
+            else:
+                body = abs(pivot_bar.close - pivot_bar.open)
+                body_pct = body / rng
+                upper_wick_pct = (pivot_bar.high - max(pivot_bar.open, pivot_bar.close)) / rng
+                lower_wick_pct = (min(pivot_bar.open, pivot_bar.close) - pivot_bar.low) / rng
+                close_pos = (pivot_bar.close - pivot_bar.low) / rng
+
+            return {
+                "don_width": don_width,
+                "atr_15m": atr_val_mid,
+                "don_width_atr": don_width_atr,
+                "entry_to_pivot_bps": slip,
+                "osc_delta": osc_delta,
+                "mins_since_prev_signal": mins_since_prev,
+                "hour_utc": hour_utc,
+                "dow": dow,
+                "body_pct": body_pct,
+                "upper_wick_pct": upper_wick_pct,
+                "lower_wick_pct": lower_wick_pct,
+                "close_pos": close_pos,
+                "pivot_loc": pivot_loc,
+            }
+
         # LONG side
         if got_low:
             near_lower = pivot_loc <= self.p.ext_band_pct
@@ -211,6 +267,7 @@ class SymbolStrategyState:
                 entry = bar.close  # tradable entry at confirmation bar close
                 slip = bps(pivot_bar.low, entry)
                 osc_name = self.p.divergence_mode
+                features = build_features("LONG", slip)
                 signal = Signal(
                     symbol=self.symbol, side="LONG",
                     entry_price=entry, pivot_price=pivot_bar.low,
@@ -221,7 +278,8 @@ class SymbolStrategyState:
                     pine_div=pine_ok,
                     cvd_div=cvd_ok,
                     pivot_time_ms=pivot_bar.open_time_ms,
-                    confirm_time_ms=bar.close_time_ms
+                    confirm_time_ms=bar.close_time_ms,
+                    features=features,
                 )
                 self._log_signal("LONG", {
                     **pivot_state,
@@ -252,6 +310,7 @@ class SymbolStrategyState:
                 entry = bar.close
                 slip = bps(pivot_bar.high, entry)
                 osc_name = self.p.divergence_mode
+                features = build_features("SHORT", slip)
                 signal = Signal(
                     symbol=self.symbol, side="SHORT",
                     entry_price=entry, pivot_price=pivot_bar.high,
@@ -262,7 +321,8 @@ class SymbolStrategyState:
                     pine_div=pine_ok,
                     cvd_div=cvd_ok,
                     pivot_time_ms=pivot_bar.open_time_ms,
-                    confirm_time_ms=bar.close_time_ms
+                    confirm_time_ms=bar.close_time_ms,
+                    features=features,
                 )
                 self._log_signal("SHORT", {
                     **pivot_state,
@@ -284,5 +344,8 @@ class SymbolStrategyState:
 
         if not got_low and not got_high:
             self._log_suppressed(bar, "no_pivot", pivot_state)
+
+        if signal is not None:
+            self.last_signal_confirm_ms = signal.confirm_time_ms
 
         return signal

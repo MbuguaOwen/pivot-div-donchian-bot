@@ -37,6 +37,8 @@ class Delta1mStore:
     def __init__(self, max_minutes: int = 240):
         self.max_minutes = max(30, int(max_minutes))
         self._deltas: Dict[int, float] = {}
+        self._quote_sums: Dict[int, float] = {}
+        self._quote_deltas: Dict[int, float] = {}
         self._closes: Deque[int] = deque(maxlen=self.max_minutes)
         self._last_close_ms: Optional[int] = None
         self._gap_count: int = 0
@@ -56,7 +58,7 @@ class Delta1mStore:
     def minutes_available(self) -> int:
         return len(self._closes)
 
-    def update_trade(self, ts_ms: int, qty: float, is_buyer_maker: bool) -> None:
+    def update_trade(self, ts_ms: int, qty: float, is_buyer_maker: bool, price: Optional[float] = None) -> None:
         close_ms = _minute_close_ms(int(ts_ms))
 
         # Fill forward gaps so lookups can be strict about continuity.
@@ -74,14 +76,23 @@ class Delta1mStore:
 
         self._ensure_minute(close_ms)
 
-        # Update delta
+        # Update delta and quote metrics
         signed = -qty if is_buyer_maker else qty
         self._deltas[close_ms] = self._deltas.get(close_ms, 0.0) + float(signed)
+
+        if price is not None:
+            qv = float(price) * float(qty)
+            self._quote_sums[close_ms] = self._quote_sums.get(close_ms, 0.0) + qv
+            self._quote_deltas[close_ms] = self._quote_deltas.get(close_ms, 0.0) + (float(price) * float(signed))
 
     def _ensure_minute(self, close_ms: int) -> None:
         # Maintain ordered closes; allow out-of-order updates within retention.
         if close_ms not in self._deltas:
             self._deltas[close_ms] = 0.0
+        if close_ms not in self._quote_sums:
+            self._quote_sums[close_ms] = 0.0
+        if close_ms not in self._quote_deltas:
+            self._quote_deltas[close_ms] = 0.0
 
         if self._last_close_ms is None:
             self._closes.append(close_ms)
@@ -105,15 +116,14 @@ class Delta1mStore:
             for k in list(self._deltas.keys()):
                 if k < oldest:
                     self._deltas.pop(k, None)
+            for k in list(self._quote_sums.keys()):
+                if k < oldest:
+                    self._quote_sums.pop(k, None)
+            for k in list(self._quote_deltas.keys()):
+                if k < oldest:
+                    self._quote_deltas.pop(k, None)
 
-    def get_delta_sum(self, end_ms: int, window_minutes: int, warmup_minutes: int = 0) -> DeltaSumResult:
-        """Sum delta over [end_ms - (window-1)*1m, end_ms] inclusive.
-
-        Requirements:
-        - end_ms must align to a minute close_time_ms (i.e., end_ms % 60000 == 59999)
-        - all minutes inside the window must exist (including zero-filled gaps)
-        - if warmup_minutes>0, require a continuous warmup history ending at end_ms
-        """
+    def _get_sum(self, metric: Dict[int, float], end_ms: int, window_minutes: int, warmup_minutes: int = 0) -> DeltaSumResult:
         end_ms = int(end_ms)
         window_minutes = int(window_minutes)
         warmup_minutes = int(warmup_minutes)
@@ -130,7 +140,7 @@ class Delta1mStore:
         total = 0.0
         for i in range(needed):
             close_ms = end_ms - i * MINUTE_MS
-            v = self._deltas.get(close_ms)
+            v = metric.get(close_ms)
             if v is None:
                 if i < window_minutes:
                     missing_window += 1
@@ -159,6 +169,48 @@ class Delta1mStore:
             delta_sum=total,
             minutes_found=needed,
             minutes_needed=needed,
+        )
+
+    def get_delta_sum(self, end_ms: int, window_minutes: int, warmup_minutes: int = 0) -> DeltaSumResult:
+        """Sum delta over [end_ms - (window-1)*1m, end_ms] inclusive."""
+        return self._get_sum(self._deltas, end_ms, window_minutes, warmup_minutes)
+
+    def get_quote_sum(self, end_ms: int, window_minutes: int, warmup_minutes: int = 0) -> DeltaSumResult:
+        """Sum quote volume (price*qty) over the window."""
+        return self._get_sum(self._quote_sums, end_ms, window_minutes, warmup_minutes)
+
+    def get_quote_delta_sum(self, end_ms: int, window_minutes: int, warmup_minutes: int = 0) -> DeltaSumResult:
+        """Sum signed quote delta (signed price*qty) over the window."""
+        return self._get_sum(self._quote_deltas, end_ms, window_minutes, warmup_minutes)
+
+    def get_quote_delta_ratio(self, end_ms: int, window_minutes: int, warmup_minutes: int = 0) -> DeltaSumResult:
+        """Compute signed quote delta / quote volume over the window."""
+        qsum_res = self.get_quote_sum(end_ms=end_ms, window_minutes=window_minutes, warmup_minutes=warmup_minutes)
+        qdelta_res = self.get_quote_delta_sum(end_ms=end_ms, window_minutes=window_minutes, warmup_minutes=warmup_minutes)
+        if not qsum_res.ok or not qdelta_res.ok:
+            return DeltaSumResult(
+                ok=False,
+                reason="insufficient_data",
+                delta_sum=0.0,
+                minutes_found=min(qsum_res.minutes_found, qdelta_res.minutes_found),
+                minutes_needed=max(qsum_res.minutes_needed, qdelta_res.minutes_needed),
+            )
+        denom = qsum_res.delta_sum
+        if abs(denom) < 1e-9:
+            return DeltaSumResult(
+                ok=False,
+                reason="zero_quote_sum",
+                delta_sum=0.0,
+                minutes_found=qsum_res.minutes_found,
+                minutes_needed=qsum_res.minutes_needed,
+            )
+        ratio = qdelta_res.delta_sum / denom
+        return DeltaSumResult(
+            ok=True,
+            reason="ok",
+            delta_sum=ratio,
+            minutes_found=qsum_res.minutes_found,
+            minutes_needed=qsum_res.minutes_needed,
         )
 
     def snapshot_tail(self, n: int = 20) -> Tuple[Tuple[int, float], ...]:
